@@ -1,8 +1,7 @@
 // QR Stock service worker — network first, cache fallback (so the app opens offline)
-var CACHE = 'qrstock-v1.2.0';
-var SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'rules.js', 'icon.svg', 'manifest.webmanifest'];
-// the barcode decoder (module + wasm) comes from jsDelivr; cache it once fetched so scanning works offline
-var CDN = 'https://cdn.jsdelivr.net/';
+var CACHE = 'qrstock-v1.2.1';
+var SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'rules.js', 'icon.svg', 'manifest.webmanifest',
+  'vendor/barcode-detector-3.2.2.js', 'vendor/zxing_reader.wasm'];
 
 self.addEventListener('install', function (e) {
   e.waitUntil(caches.open(CACHE).then(function (c) { return c.addAll(SHELL); }).then(function () { return self.skipWaiting(); }));
@@ -16,7 +15,7 @@ self.addEventListener('fetch', function (e) {
   var req = e.request;
   if (req.method !== 'GET' || req.url.indexOf('script.google') >= 0) return;
   e.respondWith(fetch(req).then(function (res) {
-    if (res.ok && (req.url.indexOf(self.location.origin) === 0 || req.url.indexOf(CDN) === 0)) {
+    if (res.ok && req.url.indexOf(self.location.origin) === 0) {
       var copy = res.clone();
       caches.open(CACHE).then(function (c) { c.put(req, copy); });
     }

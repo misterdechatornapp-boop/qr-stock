@@ -1,7 +1,7 @@
 /* QR Stock — UI */
 (function () {
   'use strict';
-  var APP_VERSION = '1.2.0';
+  var APP_VERSION = '1.2.1';
   var SETUP_PREFIX = 'QRSTOCK-SETUP:';
   var R = window.QRRules;
 
@@ -146,22 +146,38 @@
 
   /* ---------- camera ---------- */
   // Decoder: zxing-cpp (WebAssembly) behind the BarcodeDetector API. It reads small / glossy DataMatrix
-  // labels that the old zxing-js engine missed. The module + wasm load once from jsDelivr.
-  var DETECTOR_URL = 'https://cdn.jsdelivr.net/npm/barcode-detector@3.2.2/+esm';
+  // labels that the old zxing-js engine missed. Both the script and the .wasm are served from vendor/
+  // (same origin) — loading them from a CDN failed on iPhone Safari.
   var FORMATS = ['data_matrix', 'qr_code', 'micro_qr_code', 'code_128', 'code_39', 'code_93', 'codabar', 'ean_13', 'ean_8',
     'upc_a', 'upc_e', 'itf', 'pdf417', 'aztec', 'databar', 'databar_expanded'];
   var detectorP = null;
   function getDetector() {
     if (!detectorP) {
-      detectorP = import(DETECTOR_URL).then(function (m) {
-        var BD = m.BarcodeDetector;
-        return BD.getSupportedFormats().then(function (sup) {
-          return new BD({ formats: FORMATS.filter(function (f) { return sup.indexOf(f) >= 0; }) });
+      detectorP = (async function () {
+        var lib = window.BarcodeDetectionAPI;
+        if (!lib) throw new Error('decoder_script');
+        if (typeof WebAssembly !== 'object') throw new Error('no_wasm');
+        await lib.prepareZXingModule({
+          overrides: {
+            locateFile: function (path, prefix) {
+              return /\.wasm$/.test(path) ? new URL('vendor/' + path, location.href).href : prefix + path;
+            }
+          },
+          fireImmediately: true // load + compile now so failures surface here, not on the first frame
         });
-      });
-      detectorP.catch(function () { detectorP = null; }); // allow a retry after a network failure
+        var BD = lib.BarcodeDetector;
+        var sup = await BD.getSupportedFormats();
+        return new BD({ formats: FORMATS.filter(function (f) { return sup.indexOf(f) >= 0; }) });
+      })();
+      detectorP.catch(function () { detectorP = null; }); // allow a retry after a failure
     }
     return detectorP;
+  }
+  function decoderError(e) {
+    var m = String(e && e.message || e);
+    if (m === 'decoder_script') return 'โหลดตัวอ่านบาร์โค้ดไม่สำเร็จ — รีเฟรชหน้าแล้วลองใหม่';
+    if (m === 'no_wasm') return 'เบราว์เซอร์นี้ไม่รองรับ WebAssembly — อัปเดต iOS / เบราว์เซอร์';
+    return 'ตัวอ่านบาร์โค้ดเริ่มทำงานไม่ได้: ' + m;
   }
   async function detectIn(source) {
     var det = await getDetector();
@@ -182,6 +198,7 @@
       try {
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('เบราว์เซอร์นี้ไม่รองรับกล้อง (ต้องเปิดผ่าน https)');
         var detP = getDetector(); // start loading the decoder while the camera warms up
+        detP.catch(function () {}); // handled below
         cam.stream = await navigator.mediaDevices.getUserMedia({
           audio: false,
           video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }
@@ -189,7 +206,7 @@
         cam.track = cam.stream.getVideoTracks()[0];
         video.srcObject = cam.stream;
         await video.play();
-        await detP;
+        try { await detP; } catch (e) { e.decoder = true; throw e; }
         setupCamControls();
         camOn = true; paused = false;
         $('#scannerIdle').hidden = true;
@@ -198,8 +215,8 @@
         scanLoop();
       } catch (e) {
         stopStream();
-        var msg = e && e.name === 'NotAllowedError' ? 'ไม่ได้รับอนุญาตให้ใช้กล้อง — เปิดสิทธิ์กล้องให้เว็บนี้ในการตั้งค่าเบราว์เซอร์'
-          : e && /import|fetch|module/i.test(String(e.message || e)) ? 'โหลดตัวอ่านบาร์โค้ดไม่สำเร็จ ตรวจอินเทอร์เน็ต'
+        var msg = e && e.decoder ? decoderError(e)
+          : e && e.name === 'NotAllowedError' ? 'ไม่ได้รับอนุญาตให้ใช้กล้อง — เปิดสิทธิ์กล้องให้เว็บนี้ในการตั้งค่าเบราว์เซอร์'
           : 'เปิดกล้องไม่ได้: ' + (e && e.message ? e.message : e);
         toast(msg, true);
       }
@@ -297,6 +314,7 @@
     if (!f) return;
     if (camOn) await stopCam();
     toast('กำลังอ่านรูป…');
+    try { await getDetector(); } catch (err) { return toast(decoderError(err), true); }
     try {
       var bmp = await createImageBitmap(f);
       var hit = await detectIn(bmp);
@@ -307,7 +325,7 @@
       if (!hit) throw new Error('none');
       handleRaw(hit.rawValue, String(hit.format || '').toUpperCase());
     } catch (err) {
-      toast(/import|fetch|module/i.test(String(err && err.message)) ? 'โหลดตัวอ่านบาร์โค้ดไม่สำเร็จ ตรวจอินเทอร์เน็ต' : 'ไม่พบ QR / บาร์โค้ดในรูปนี้', true);
+      toast(err && err.message === 'none' ? 'ไม่พบ QR / บาร์โค้ดในรูปนี้' : 'อ่านรูปไม่ได้: ' + (err && err.message || err), true);
     }
   });
 
