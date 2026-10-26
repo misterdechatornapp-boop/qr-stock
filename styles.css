@@ -225,6 +225,9 @@ details summary { cursor: pointer; color: var(--muted); font-size: 14px; }
 .badge.bad { background: var(--bad-soft); color: var(--bad); }
 .badge.warn { background: var(--warn-soft); color: var(--warn); }
 .badge.ok { background: var(--ok-soft); color: var(--ok); }
+label > .badge { align-self: flex-start; }
+.sub-list .btn { text-align: left; gap: 10px; }
+.sub-list .btn span:last-child { flex: none; }
 .photo-full { width: 100%; max-height: 320px; object-fit: contain; border-radius: 12px; background: var(--surface-2); }
 .qty-row { display: flex; align-items: center; gap: 8px; }
 .qty-row .btn { width: 44px; padding: 0; font-size: 20px; }

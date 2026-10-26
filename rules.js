@@ -353,8 +353,133 @@
     ];
   }
 
+  /* ---------- OCR of the printed (human-readable) UDI text ---------- */
+  // characters OCR commonly reads instead of digits
+  var AS_DIGIT = { O: '0', Q: '0', D: '0', U: '0', I: '1', L: '1', '|': '1', J: '1', Z: '2', S: '5', B: '8', G: '6', T: '7', A: '4' };
+  function toDigits(s) { return String(s).replace(/[OQDUILJ|ZSBGTA]/g, function (c) { return AS_DIGIT[c]; }); }
+  // fold look-alikes so "12756806MOO1" and "12756806M001" compare equal
+  function fold(s) { return String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/[OQD]/g, '0').replace(/[IL|]/g, '1').replace(/S/g, '5').replace(/B/g, '8').replace(/Z/g, '2'); }
+  function lev(a, b) {
+    if (a === b) return 0;
+    var prev = [], cur, i, j;
+    for (j = 0; j <= b.length; j++) prev[j] = j;
+    for (i = 1; i <= a.length; i++) {
+      cur = [i];
+      for (j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = cur;
+    }
+    return prev[b.length];
+  }
+  function validYYMMDD(v) { return /^\d\d(0[1-9]|1[0-2])(0\d|[12]\d|3[01])$/.test(v || ''); }
+
+  var HRI_AI = { '00': 'n18', '01': 'n14', '02': 'n14', '10': 'x20', '11': 'n6', '13': 'n6', '15': 'n6', '17': 'n6', '21': 'x20', '240': 'x30', '241': 'x30', '30': 'n8', '37': 'n8' };
+
+  /**
+   * Read "(01)08052109225046 (240)EU5094 (11)260416 (21)12756806M001" out of OCR text, check and repair it.
+   * known = {types: [{type_code, ref, name}], items: [{code, type_code, serial, lot}]}
+   * -> {fields: {ai: value}, checks: {ai: {status: ok|fixed|bad|unverified, note, read}}, suggestions: [...], found}
+   */
+  function parseHri(text, known) {
+    known = known || {};
+    var types = known.types || [], items = known.items || [];
+    var fields = {}, read = {};
+    String(text || '').toUpperCase().replace(/[{\[]/g, '(').replace(/[}\]]/g, ')').split(/\r?\n/).forEach(function (line) {
+      var re = /\(?\s*([0-9OQDILZSB|]{2,3})\s*\)\s*([^()]*)/g, m;
+      while ((m = re.exec(line))) {
+        var ai = toDigits(m[1]);
+        var spec = HRI_AI[ai];
+        if (!spec || fields[ai]) continue;
+        var v;
+        // numeric fields may be split by stray spaces; text fields end at the first space (other label text follows)
+        if (spec[0] === 'n') v = toDigits(m[2].replace(/\s+/g, '')).replace(/\D/g, '').slice(0, Number(spec.slice(1)));
+        else v = (m[2].trim().split(/\s+/)[0] || '').replace(/[^A-Z0-9\-\/.]/g, '').slice(0, Number(spec.slice(1)));
+        if (v) { fields[ai] = v; read[ai] = m[2].trim(); }
+      }
+    });
+    var checks = {};
+    // (01) GTIN: check digit, else snap to a GTIN we already have (≤2 digits apart)
+    if (fields['01']) {
+      var g = fields['01'];
+      if (g.length === 13) g = '0' + g;
+      if (g.length === 14 && mod10Valid(g)) { fields['01'] = g; checks['01'] = { status: 'ok', note: 'เลขตรวจสอบถูกต้อง' }; }
+      else {
+        var near = types.map(function (t) { return { t: t, d: g.length === t.type_code.length ? lev(g, t.type_code) : 99 }; })
+          .filter(function (x) { return x.d <= 2; }).sort(function (a, b) { return a.d - b.d; });
+        if (near.length && (near.length === 1 || near[0].d < near[1].d)) {
+          checks['01'] = { status: 'fixed', note: 'อ่านได้ ' + g + ' (เลขตรวจสอบไม่ผ่าน) → ใช้ GTIN ที่มีในคลัง ต่างกัน ' + near[0].d + ' ตัว', read: g };
+          fields['01'] = near[0].t.type_code;
+        } else checks['01'] = { status: 'bad', note: 'เลขตรวจสอบไม่ผ่าน — แก้ให้ตรงกับฉลาก', read: g };
+      }
+    }
+    ['11', '13', '15', '17'].forEach(function (ai) {
+      if (fields[ai]) checks[ai] = validYYMMDD(fields[ai]) ? { status: 'ok', note: 'วันที่ถูกต้อง' } : { status: 'bad', note: 'ไม่ใช่วันที่ที่มีจริง (YYMMDD)' };
+    });
+    // (240) REF must belong to the GTIN when we know that product
+    var prod = null;
+    types.forEach(function (t) { if (t.type_code === fields['01']) prod = t; });
+    if (fields['240']) {
+      if (prod && prod.ref) {
+        var dRef = lev(fold(prod.ref), fold(fields['240']));
+        if (dRef === 0) { fields['240'] = prod.ref; checks['240'] = { status: 'ok', note: 'ตรงกับรุ่น ' + (prod.name || '') }; }
+        else if (dRef === 1) { checks['240'] = { status: 'fixed', note: 'อ่านได้ ' + fields['240'] + ' → ใช้ REF ของรุ่นนี้', read: fields['240'] }; fields['240'] = prod.ref; }
+        else checks['240'] = { status: 'bad', note: 'รุ่นนี้บันทึก REF ไว้เป็น ' + prod.ref };
+      } else checks['240'] = { status: 'unverified', note: 'ยังไม่มีรุ่นนี้ในคลังให้เทียบ' };
+    } else if (prod && prod.ref) { fields['240'] = prod.ref; checks['240'] = { status: 'fixed', note: 'อ่านไม่ได้ → ใช้ REF ของรุ่นนี้' }; }
+    ['21', '10'].forEach(function (ai) {
+      if (fields[ai]) checks[ai] = { status: 'unverified', note: 'ไม่มีเลขตรวจสอบ — เทียบกับฉลากด้วยตา' };
+    });
+    // nearby stock rows: same/similar serial (or lot), same type first
+    var key = fields['21'] ? 'serial' : fields['10'] ? 'lot' : '';
+    var want = key ? fold(fields[key === 'serial' ? '21' : '10']) : '';
+    var suggestions = [];
+    if (want) {
+      items.forEach(function (it) {
+        if (!it[key]) return;
+        var d = lev(want, fold(it[key]));
+        var sameType = it.type_code === fields['01'];
+        if (d <= 2 && (sameType || d <= 1)) suggestions.push({ item: it, dist: d, sameType: sameType });
+      });
+      suggestions.sort(function (a, b) { return (b.sameType - a.sameType) || (a.dist - b.dist); });
+      suggestions = suggestions.slice(0, 5);
+    }
+    return { fields: fields, checks: checks, suggestions: suggestions, found: !!(fields['01'] || fields['21'] || fields['10']) };
+  }
+
+  // combine several OCR passes: per AI prefer values that pass their check, then the most frequent, then the longest
+  function mergeHri(list) {
+    var votes = {}, out = {};
+    list.forEach(function (f) { Object.keys(f || {}).forEach(function (ai) { (votes[ai] = votes[ai] || []).push(f[ai]); }); });
+    Object.keys(votes).forEach(function (ai) {
+      var vs = votes[ai];
+      var good = vs.filter(function (v) {
+        if (ai === '01') return (v.length === 14 && mod10Valid(v)) || (v.length === 13 && mod10Valid('0' + v));
+        if (/^1[1-7]$/.test(ai)) return validYYMMDD(v);
+        return true;
+      });
+      var pool = good.length ? good : vs, cnt = {};
+      pool.forEach(function (v) { cnt[v] = (cnt[v] || 0) + 1; });
+      out[ai] = pool.slice().sort(function (a, b) { return (cnt[b] - cnt[a]) || (b.length - a.length); })[0];
+    });
+    return out;
+  }
+  // enough to stop trying more OCR passes
+  function hriComplete(f) {
+    var g = f['01'] || '';
+    if (g.length === 13) g = '0' + g;
+    if (!(g.length === 14 && mod10Valid(g))) return false;
+    if (!f['21'] && !f['10']) return false;
+    return ['11', '17'].every(function (ai) { return !f[ai] || validYYMMDD(f[ai]); });
+  }
+
+  // fields → "(01)…(240)…(11)…(21)…" so the normal GS1 pipeline can take it from here
+  function hriString(fields) {
+    return ['01', '240', '11', '13', '15', '17', '10', '21'].filter(function (ai) { return fields[ai]; })
+      .map(function (ai) { return '(' + ai + ')' + fields[ai]; }).join('');
+  }
+
   var api = { parseGS1: parseGS1, inspect: inspect, apply: apply, matches: matches, extract: extract, post: post, gtinValid: gtinValid,
-    defaultRules: defaultRules, itemKey: itemKey, gs1Extras: gs1Extras, gs1Date: gs1Date, ROLES: ROLES };
+    defaultRules: defaultRules, itemKey: itemKey, gs1Extras: gs1Extras, gs1Date: gs1Date, ROLES: ROLES,
+    parseHri: parseHri, hriString: hriString, mergeHri: mergeHri, hriComplete: hriComplete, fold: fold, lev: lev };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.QRRules = api;
 })(this);

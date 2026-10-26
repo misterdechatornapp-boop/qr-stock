@@ -1,4 +1,5 @@
-﻿# secrets / per-install config โ€” never commit
+# secrets / per-install config - never commit
 local-setup.json
 setup-qr.html
 gas/.clasp.json
+_scantest/

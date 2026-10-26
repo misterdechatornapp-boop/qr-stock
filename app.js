@@ -1,7 +1,7 @@
 /* QR Stock — UI */
 (function () {
   'use strict';
-  var APP_VERSION = '1.3.0';
+  var APP_VERSION = '1.4.0';
   var SETUP_PREFIX = 'QRSTOCK-SETUP:';
   var R = window.QRRules;
 
@@ -330,7 +330,9 @@
   async function decodePhoto(f) {
     var bmp = await createImageBitmap(f);
     var longest = Math.max(bmp.width, bmp.height);
-    var sizes = [Math.min(longest, 2000), longest, 1200].filter(function (v, i, a) { return v <= longest && a.indexOf(v) === i; });
+    var sizes = [Math.min(longest, 2000), longest, 1200].filter(function (v, i, a) {
+      return v <= longest && a.slice(0, i).every(function (u) { return Math.abs(u - v) > v * 0.15; }); // skip near-duplicate sizes
+    });
     for (var i = 0; i < sizes.length; i++) {
       var k = sizes[i] / longest;
       var src = k === 1 ? bmp : await createImageBitmap(bmp, { resizeWidth: Math.round(bmp.width * k), resizeHeight: Math.round(bmp.height * k), resizeQuality: 'high' });
@@ -345,16 +347,142 @@
     if (camOn) await stopCam();
     toast('กำลังอ่านรูป…');
     try { await getDetector(); } catch (err) { return toast(decoderError(err), true); }
+    getOcr().catch(function () {}); // warm the OCR engine in parallel in case the code turns out unreadable
     try {
       var hit = await decodePhoto(f);
-      if (!hit) throw new Error('none');
-      handleRaw(hit.rawValue, String(hit.format || '').toUpperCase());
+      if (hit) return handleRaw(hit.rawValue, String(hit.format || '').toUpperCase());
+      // code unreadable → read the printed "(01)… (21)…" text on the label instead
+      if (await ocrLabel(f)) return;
+      throw new Error('none');
     } catch (err) {
       toast(err && err.message === 'none' ? 'ไม่พบ QR / บาร์โค้ดในรูปนี้ — ลองถ่ายให้โค้ดเต็มกรอบและไม่มีแสงสะท้อน' : 'อ่านรูปไม่ได้: ' + (err && err.message || err), true);
     }
   }
   $('#fileCam').addEventListener('change', onPhotoPicked);
   $('#fileImg').addEventListener('change', onPhotoPicked);
+
+  /* ---------- OCR fallback: read the human-readable UDI text ---------- */
+  // tesseract.js + LSTM core + English model are served from vendor/tesseract (≈7 MB, loaded on first use only)
+  var ocrP = null;
+  function loadScript(src) {
+    return new Promise(function (resolve, reject) {
+      var el = document.createElement('script');
+      el.src = src; el.onload = resolve; el.onerror = function () { reject(new Error('โหลด ' + src + ' ไม่ได้')); };
+      document.head.appendChild(el);
+    });
+  }
+  function getOcr() {
+    if (!ocrP) {
+      ocrP = (async function () {
+        if (!window.Tesseract) await loadScript('vendor/tesseract/tesseract.min.js');
+        var base = new URL('vendor/tesseract/', location.href).href;
+        var w = await Tesseract.createWorker('eng', 1, {
+          workerPath: base + 'worker.min.js', corePath: base + 'core', langPath: base + 'lang', gzip: true, workerBlobURL: false,
+          logger: function (m) {
+            if (/load/.test(m.status) && m.progress < 1) toast('กำลังโหลดตัวอ่านตัวหนังสือ (ครั้งแรกเท่านั้น)…');
+          }
+        });
+        await w.setParameters({ tessedit_char_whitelist: '0123456789()ABCDEFGHIJKLMNOPQRSTUVWXYZ-./ ', tessedit_pageseg_mode: '11' });
+        return w;
+      })();
+      ocrP.catch(function () { ocrP = null; });
+    }
+    return ocrP;
+  }
+  // scale (small photos up, big ones down — tesseract likes ~2400 px) and rotate onto a white canvas
+  function ocrCanvas(bmp, deg, target) {
+    var s = Math.max(0.3, Math.min(2.2, target / Math.max(bmp.width, bmp.height)));
+    var W = bmp.width * s, H = bmp.height * s, a = deg * Math.PI / 180;
+    var cw = Math.abs(W * Math.cos(a)) + Math.abs(H * Math.sin(a)), ch = Math.abs(W * Math.sin(a)) + Math.abs(H * Math.cos(a));
+    var cv = document.createElement('canvas');
+    cv.width = Math.round(cw); cv.height = Math.round(ch);
+    var g = cv.getContext('2d');
+    g.fillStyle = '#fff'; g.fillRect(0, 0, cw, ch);
+    g.imageSmoothingQuality = 'high';
+    g.translate(cw / 2, ch / 2); g.rotate(a); g.drawImage(bmp, -W / 2, -H / 2, W, H);
+    return cv;
+  }
+  // straight first, then tilted photos: stop as soon as GTIN checks out and a serial/lot is present
+  // [page-seg mode, rotation°, longest side px] — a quick pass first, bigger/rotated ones only when needed
+  var OCR_PASSES = [['11', 0, 1600], ['3', 0, 2400], ['3', 12, 2400], ['3', -12, 2400], ['3', 20, 2400], ['3', -20, 2400]];
+  // good enough when the GTIN passes its own check digit (plus serial/lot), or — if it only snapped to a known
+  // product — when the serial/lot also matches a stock row exactly; otherwise keep trying more passes
+  function ocrGood(fields) {
+    if (R.hriComplete(fields)) return true;
+    var res = R.parseHri(R.hriString(fields), { types: products, items: items });
+    var g = res.checks['01'];
+    return !!(g && g.status === 'fixed' && res.suggestions.length && res.suggestions[0].dist === 0 && res.suggestions[0].sameType);
+  }
+  async function ocrRead(file) {
+    var bmp = await createImageBitmap(file);
+    var w = await getOcr();
+    var texts = [], found = [];
+    for (var i = 0; i < OCR_PASSES.length; i++) {
+      toast('กำลังอ่านตัวหนังสือ… รอบ ' + (i + 1) + '/' + OCR_PASSES.length);
+      await w.setParameters({ tessedit_pageseg_mode: OCR_PASSES[i][0] });
+      var r = await w.recognize(ocrCanvas(bmp, OCR_PASSES[i][1], OCR_PASSES[i][2]));
+      texts.push(r.data.text || '');
+      found.push(R.parseHri(r.data.text, {}).fields);
+      if (ocrGood(R.mergeHri(found))) break;
+    }
+    return { fields: R.mergeHri(found), text: texts.join('\n— — —\n') };
+  }
+  // -> true when handled (dialog shown or error reported), false when nothing usable was read
+  async function ocrLabel(file) {
+    toast('ไม่พบโค้ด — ลองอ่านตัวหนังสือบนฉลาก…');
+    var o;
+    try { o = await ocrRead(file); } catch (e) { toast('อ่านตัวหนังสือไม่ได้: ' + (e && e.message || e), true); return true; }
+    var res = R.parseHri(R.hriString(o.fields), { types: products, items: items });
+    if (!res.found) return false;
+    await confirmOcr(res, o.text);
+    return true;
+  }
+
+  var OCR_FIELDS = [['01', 'GTIN (01)'], ['240', 'REF (240)'], ['11', 'วันผลิต (11) YYMMDD'], ['17', 'วันหมดอายุ (17) YYMMDD'], ['10', 'Lot (10)'], ['21', 'Serial (21)']];
+  var CHECK_BADGE = { ok: 'ok', fixed: 'warn', bad: 'bad', unverified: 'warn' };
+  var CHECK_TH = { ok: '✓', fixed: 'แก้ให้แล้ว', bad: 'ผิด', unverified: 'ยังไม่ยืนยัน' };
+
+  // nothing from OCR is used until the user ticks the box and presses "ใช้ค่านี้" (or picks a stock row)
+  async function confirmOcr(res, text) {
+    var html = '<h3>อ่านจากตัวหนังสือบนฉลาก</h3>' +
+      '<p class="small" style="margin:0">⚠️ ค่าเหล่านี้มาจากการอ่านตัวหนังสือ (OCR) อาจผิดได้ — ตรวจกับฉลากทีละช่องก่อนใช้</p>' +
+      OCR_FIELDS.map(function (f) {
+        var ck = res.checks[f[0]];
+        if (!res.fields[f[0]] && ['17', '10'].indexOf(f[0]) >= 0) return ''; // optional fields the label did not have
+        var badge = ck ? ' <span class="badge ' + CHECK_BADGE[ck.status] + '">' + CHECK_TH[ck.status] + '</span>' : '';
+        var note = ck && ck.note ? '<span class="small muted">' + esc(ck.note) + '</span>' : '';
+        return '<label>' + esc(f[1]) + badge + '<input name="f' + f[0] + '" value="' + esc(res.fields[f[0]] || '') + '" autocapitalize="characters" spellcheck="false">' + note + '</label>';
+      }).join('') +
+      (res.suggestions.length ? '<div class="section-label">ใกล้เคียงในคลัง — กดเพื่อใช้รายการนั้น</div><ul class="sub-list">' + res.suggestions.map(function (sg) {
+        var it = sg.item, p = byType[it.type_code];
+        return '<li><button class="btn small" style="width:100%;justify-content:space-between" value="sug:' + esc(it.code) + '" formnovalidate><span>' +
+          esc(it.serial ? 'SN ' + it.serial : 'LOT ' + it.lot) + ' · ' + esc((p && p.name) || it.type_code) + '</span><span class="muted">' +
+          (sg.dist === 0 ? 'ตรงกัน' : 'ต่าง ' + sg.dist + ' ตัว') + '</span></button></li>';
+      }).join('') + '</ul>' : '') +
+      '<details><summary>ข้อความที่อ่านได้ทั้งหมด</summary><div class="raw" style="margin-top:8px">' + esc(text.trim()) + '</div></details>' +
+      '<label class="check"><input type="checkbox" name="checked" required> ตรวจแล้ว ค่าตรงกับฉลาก</label>';
+    var r = await dialog(html, [['ยกเลิก'], ['ใช้ค่านี้', 'primary', 'ok']]);
+    if (r.btn.indexOf('sug:') === 0) {
+      var it = byCode[r.btn.slice(4)];
+      if (it) useOcrValues({ '01': it.type_code, '240': it.ref, '21': it.serial, '10': it.lot });
+      return;
+    }
+    if (r.btn !== 'ok') return;
+    var f = {};
+    OCR_FIELDS.forEach(function (x) { var v = (r.data['f' + x[0]] || '').trim().toUpperCase(); if (v) f[x[0]] = v; });
+    if (!f['01'] && !f['21'] && !f['10']) return toast('ไม่มีค่าให้ใช้', true);
+    useOcrValues(f);
+  }
+
+  function useOcrValues(fields) {
+    var raw = R.hriString(fields);
+    beep();
+    lastRaw = { raw: raw, format: 'OCR' };
+    current = parseCode(raw, 'OCR');
+    current.ocr = true;
+    go('scan');
+    resolveCurrent(true);
+  }
 
   $('#manualForm').addEventListener('submit', function (e) {
     e.preventDefault();
@@ -415,7 +543,7 @@
     if (!cfg.url) { c.status = statusOf(c); c.offline = true; renderResult(); return; }
     var shown = c.status;
     try {
-      var r = await api('scan', { code: c.code, type_code: c.type, raw: c.raw, log: log !== false });
+      var r = await api('scan', { code: c.code, type_code: c.type, raw: (c.ocr ? '[OCR] ' : '') + c.raw, log: log !== false });
       if (c !== current) return;
       c.item = r.item || null;
       c.product = r.product || null;
@@ -485,6 +613,7 @@
       wait: '<span class="status-pill wait">กำลังตรวจสอบ…</span>'
     }[c.status];
     var h = '<div class="card result ' + (c.status === 'ok' ? 'ok' : c.status === 'wait' ? '' : 'new') + '">' + pill +
+      (c.ocr ? '<p class="small" style="margin:0"><span class="badge warn">อ่านจากตัวหนังสือ (OCR)</span> ตรวจค่ากับฉลากก่อนกดบันทึก</p>' : '') +
       productHead(c.product, c.type) + idRows(c);
 
     if (c.status === 'ok' && c.item) {

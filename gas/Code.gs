@@ -7,7 +7,7 @@
  *   Products — one row per product type (key: type_code = GTIN for GS1 codes)
  *   Items    — one row per stock unit (key: code = type|SN:serial, type|LOT:lot, or type)
  */
-var VERSION = '1.3.0';
+var VERSION = '1.4.0';
 
 var SHEETS = {
   Products: ['type_code', 'ref', 'name', 'category', 'brand', 'note', 'image_id', 'thumb', 'created_at', 'updated_at'],
@@ -119,6 +119,7 @@ function saveItem_(req) {
   var detail = idx !== undefined ? 'แก้ไขข้อมูล' : 'ลงทะเบียนใหม่';
   if (it.qty !== undefined && String(it.qty) !== String(cur.qty === undefined ? '' : cur.qty)) detail += ' · จำนวน ' + (cur.qty === undefined || cur.qty === '' ? '-' : cur.qty) + ' → ' + rec.qty;
   if (it.note && it.note !== cur.note) detail += ' · note: ' + String(it.note).slice(0, 200);
+  if (idx === undefined && it.format === 'OCR') detail += ' · ค่าจากการอ่านตัวหนังสือบนฉลาก (OCR) ผู้ใช้ยืนยันแล้ว';
   log_(idx !== undefined ? 'update' : 'create', code, it.raw_sample || '', detail, req.device);
   if (!product) {
     var ph = find_('Products', type);
