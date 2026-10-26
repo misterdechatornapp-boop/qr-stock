@@ -1,0 +1,14 @@
+{
+  "name": "QR Stock",
+  "short_name": "QR Stock",
+  "description": "สแกน QR / บาร์โค้ด ลงทะเบียนสินค้าเข้าคลัง",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f4f6f5",
+  "theme_color": "#0f766e",
+  "lang": "th",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

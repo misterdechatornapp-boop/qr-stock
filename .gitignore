@@ -1,0 +1,4 @@
+# secrets / per-install config — never commit
+local-setup.json
+setup-qr.html
+gas/.clasp.json

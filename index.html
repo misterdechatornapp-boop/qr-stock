@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f766e">
+<title>QR Stock</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Thai:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><img src="icon.svg" alt="" width="28" height="28"><span>QR Stock</span></div>
+  <button class="conn" id="connBadge" data-go="settings" type="button"><span class="dot"></span><span id="connText">ยังไม่เชื่อมต่อ</span></button>
+</header>
+
+<main>
+  <!-- ============ SCAN ============ -->
+  <section class="view" id="view-scan">
+    <div class="scanner-wrap">
+      <div id="reader"></div>
+      <div class="scanner-idle" id="scannerIdle">
+        <svg viewBox="0 0 24 24" width="40" height="40"><path d="M4 7V5a1 1 0 0 1 1-1h2M17 4h2a1 1 0 0 1 1 1v2M20 17v2a1 1 0 0 1-1 1h-2M7 20H5a1 1 0 0 1-1-1v-2M7 12h10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <p>กดเปิดกล้องเพื่อสแกน QR / บาร์โค้ด</p>
+      </div>
+    </div>
+    <div class="scan-actions">
+      <button class="btn primary" id="btnCam" type="button">เปิดกล้อง</button>
+      <label class="btn" for="fileImg">สแกนจากรูป</label>
+      <input type="file" id="fileImg" accept="image/*" hidden>
+    </div>
+    <form class="manual" id="manualForm" autocomplete="off">
+      <input id="manualInput" placeholder="พิมพ์ / ยิงเครื่องสแกน แล้วกด Enter" enterkeyhint="search">
+      <button class="btn" type="submit">ตรวจ</button>
+    </form>
+
+    <div id="result"></div>
+  </section>
+
+  <!-- ============ STOCK ============ -->
+  <section class="view" id="view-stock" hidden>
+    <div class="toolbar">
+      <input type="search" id="stockSearch" placeholder="ค้นหารหัส ชื่อ หรือ note">
+      <button class="btn icon" id="btnRefresh" type="button" title="โหลดใหม่" aria-label="โหลดใหม่">⟳</button>
+    </div>
+    <div class="toolbar sub">
+      <span id="stockCount" class="muted"></span>
+      <span class="grow"></span>
+      <button class="btn small" id="btnAddManual" type="button">+ เพิ่มเอง</button>
+      <button class="btn small" id="btnExport" type="button">Export CSV</button>
+    </div>
+    <ul class="list" id="stockList"></ul>
+  </section>
+
+  <!-- ============ RULES ============ -->
+  <section class="view" id="view-rules" hidden>
+    <div class="card">
+      <h2>ทดสอบการอ่านค่า</h2>
+      <p class="muted">วางค่าที่สแกนได้ แล้วดูว่าแต่ละกฎจะแยกเป็นรหัสสินค้าอะไร</p>
+      <textarea id="ruleSample" rows="2" placeholder="เช่น (01)08850999320014(17)271231(10)LOT55"></textarea>
+      <div id="ruleTest"></div>
+    </div>
+    <div class="toolbar sub">
+      <h2 class="grow">กฎการอ่านค่า</h2>
+      <button class="btn small" id="btnAddRule" type="button">+ เพิ่มกฎ</button>
+    </div>
+    <p class="muted small">ระบบจะลองกฎจากบนลงล่าง ใช้กฎแรกที่ตรงและได้ค่า · ถ้าไม่มีกฎไหนตรง จะใช้ค่าทั้งหมดเป็นรหัส</p>
+    <ul class="list" id="ruleList"></ul>
+    <div class="row-end"><button class="btn primary" id="btnSaveRules" type="button" disabled>บันทึกกฎ (ใช้ร่วมทุกเครื่อง)</button></div>
+  </section>
+
+  <!-- ============ SETTINGS ============ -->
+  <section class="view" id="view-settings" hidden>
+    <div class="card">
+      <h2>เชื่อมต่อ Google Sheet</h2>
+      <p class="muted">วิธีง่ายสุด: เปิดหน้า <b>สแกน</b> แล้วสแกน “QR ตั้งค่า” ที่ได้รับ ระบบจะกรอกให้อัตโนมัติ</p>
+      <label>Web app URL (Apps Script)<input id="cfgUrl" placeholder="https://script.google.com/macros/s/…/exec" inputmode="url"></label>
+      <label>รหัสเข้าใช้ (API key)<input id="cfgKey" type="password" autocomplete="off"></label>
+      <label>ชื่อเครื่องนี้ (บันทึกในประวัติ)<input id="cfgDevice" placeholder="เช่น มือถือคลัง 1"></label>
+      <div class="row-end">
+        <button class="btn" id="btnClearCfg" type="button">ล้างการตั้งค่า</button>
+        <button class="btn primary" id="btnSaveCfg" type="button">บันทึก + ทดสอบ</button>
+      </div>
+      <p id="cfgStatus" class="muted"></p>
+    </div>
+    <div class="card">
+      <h2>การสแกน</h2>
+      <label class="check"><input type="checkbox" id="optBeep" checked> เสียงบี๊บเมื่อสแกนได้</label>
+      <label class="check"><input type="checkbox" id="optAutoCam"> เปิดกล้องอัตโนมัติเมื่อเข้าหน้าสแกน</label>
+    </div>
+    <p class="muted small center">QR Stock <span id="appVer"></span></p>
+  </section>
+</main>
+
+<nav class="tabs" aria-label="เมนู">
+  <button data-go="scan" class="on" type="button"><svg viewBox="0 0 24 24"><path d="M4 7V5a1 1 0 0 1 1-1h2M17 4h2a1 1 0 0 1 1 1v2M20 17v2a1 1 0 0 1-1 1h-2M7 20H5a1 1 0 0 1-1-1v-2M7 12h10"/></svg>สแกน</button>
+  <button data-go="stock" type="button"><svg viewBox="0 0 24 24"><path d="M3 7l9-4 9 4-9 4-9-4zM3 7v10l9 4 9-4V7M12 11v10"/></svg>คลัง</button>
+  <button data-go="rules" type="button"><svg viewBox="0 0 24 24"><path d="M4 6h10M4 12h16M4 18h7M18 4v4M15 6h6"/></svg>กฎอ่านค่า</button>
+  <button data-go="settings" type="button"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>ตั้งค่า</button>
+</nav>
+
+<dialog id="dlg"><form method="dialog" id="dlgForm"></form></dialog>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script src="rules.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
