@@ -24,6 +24,10 @@
     <div class="scanner-wrap">
       <div id="reader"><video id="camVideo" playsinline muted autoplay></video></div>
       <div class="guide" id="camGuide" hidden></div>
+      <div class="cam-hint" id="camHint" hidden>
+        <span>ยังหาโค้ดไม่เจอ · ถอยออก ~20 ซม. แล้วซูม 2× · เอียงหลบแสงสะท้อน</span>
+        <label for="fileCam">📷 ถ่ายรูปแทน</label>
+      </div>
       <div class="cam-ctrl" id="camCtrl" hidden>
         <span class="zoom-label" id="zoomLabel">1×</span>
         <input type="range" id="zoomRange" min="1" max="4" step="0.1" value="1" aria-label="ซูม">
@@ -38,7 +42,10 @@
     </div>
     <div class="scan-actions">
       <button class="btn primary" id="btnCam" type="button">เปิดกล้อง</button>
-      <label class="btn" for="fileImg">สแกนจากรูป</label>
+      <label class="btn" for="fileCam">📷 ถ่ายรูปสแกน</label>
+      <label class="btn" for="fileImg">จากอัลบั้ม</label>
+      <!-- capture opens the phone's own camera app: macro lens + HDR → sharp close-ups of small labels -->
+      <input type="file" id="fileCam" accept="image/*" capture="environment" hidden>
       <input type="file" id="fileImg" accept="image/*" hidden>
     </div>
     <form class="manual" id="manualForm" autocomplete="off">

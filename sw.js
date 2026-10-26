@@ -1,5 +1,5 @@
 // QR Stock service worker — network first, cache fallback (so the app opens offline)
-var CACHE = 'qrstock-v1.2.1';
+var CACHE = 'qrstock-v1.3.0';
 var SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'rules.js', 'icon.svg', 'manifest.webmanifest',
   'vendor/barcode-detector-3.2.2.js', 'vendor/zxing_reader.wasm'];
 

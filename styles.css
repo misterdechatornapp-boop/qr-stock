@@ -150,7 +150,15 @@ label.check input { width: 20px; min-height: 20px; height: 20px; accent-color: v
   gap: 6px; color: #a7b8b4; text-align: center; padding: 16px;
 }
 .scanner-idle p { margin: 0; }
-.scan-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.scan-actions { display: grid; grid-template-columns: 1fr 1.25fr 1fr; gap: 8px; }
+.scan-actions .btn { padding: 0 8px; font-size: 15px; white-space: nowrap; }
+.cam-hint {
+  position: absolute; left: 10px; right: 10px; top: 10px; display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; border-radius: 12px; background: rgba(0,0,0,.62); color: #fff; font-size: 13px; line-height: 1.35;
+  backdrop-filter: blur(6px);
+}
+.cam-hint span { flex: 1; }
+.cam-hint label { flex: none; color: #062c27; background: #2dd4bf; font-weight: 700; border-radius: 99px; padding: 6px 12px; cursor: pointer; }
 .manual { display: flex; gap: 8px; }
 
 /* result */

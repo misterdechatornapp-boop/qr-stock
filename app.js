@@ -1,7 +1,7 @@
 /* QR Stock — UI */
 (function () {
   'use strict';
-  var APP_VERSION = '1.2.1';
+  var APP_VERSION = '1.3.0';
   var SETUP_PREFIX = 'QRSTOCK-SETUP:';
   var R = window.QRRules;
 
@@ -105,7 +105,10 @@
     } catch (e) { setConn('bad'); throw new Error('network'); }
     var data;
     try { data = await res.json(); } catch (e) { setConn('bad'); throw new Error('network'); }
-    if (!data.ok) { if (data.error === 'unauthorized') setConn('bad'); throw new Error(data.error || 'error'); }
+    if (!data.ok) {
+      if (data.error === 'unauthorized') setConn('bad');
+      var err = new Error(data.error || 'error'); err.data = data; throw err;
+    }
     setConn('ok');
     return data;
   }
@@ -117,18 +120,28 @@
     $('#connText').textContent = state === 'ok' ? 'เชื่อมต่อแล้ว' : state === 'bad' ? 'เชื่อมต่อไม่ได้' : 'ยังไม่เชื่อมต่อ';
   }
 
+  var lastSync = store('lastSync') || 0, syncing = false;
   async function syncAll(silent) {
     if (!cfg.url) { setConn(null); return; }
+    if (syncing) return;
+    syncing = true;
     try {
       var r = await Promise.all([api('list'), api('getRules')]);
       items = r[0].items || [];
       products = r[0].products || [];
       saveLocal();
+      lastSync = Date.now(); store('lastSync', lastSync);
       var srvRules = r[1].rules ? JSON.parse(r[1].rules) : null;
       if (srvRules && srvRules.length && !rulesDirty) { rules = srvRules; store('rules2', rules); renderRules(); }
       if (!silent) toast('โหลดข้อมูลล่าสุดแล้ว');
     } catch (e) { if (!silent) toast(errText(e), true); }
+    finally { syncing = false; }
   }
+  // keep the local copy fresh so scan results can be shown instantly (other devices add items too)
+  setInterval(function () { if (!document.hidden && cfg.url && cfg.key) syncAll(true); }, 60000);
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden && cfg.url && cfg.key && Date.now() - lastSync > 30000) syncAll(true);
+  });
 
   /* ---------- navigation ---------- */
   function go(view) {
@@ -187,7 +200,8 @@
 
   var SCAN_BOX = { x: 0.07, y: 0.12, w: 0.86, h: 0.76 }; // must match .guide in styles.css
   var MAX_DECODE = 1600; // px, longest side handed to the decoder per frame
-  var cam = { stream: null, track: null, hwZoom: null, zoom: 1, torch: false, timer: 0 };
+  var HINT_AFTER = 4000; // ms without a hit before showing tips
+  var cam = { stream: null, track: null, hwZoom: null, zoom: 1, torch: false, timer: 0, since: 0 };
   var camOn = false, paused = false;
   var video = $('#camVideo');
   var frameCanvas = document.createElement('canvas');
@@ -208,7 +222,7 @@
         await video.play();
         try { await detP; } catch (e) { e.decoder = true; throw e; }
         setupCamControls();
-        camOn = true; paused = false;
+        camOn = true; paused = false; cam.since = Date.now();
         $('#scannerIdle').hidden = true;
         $('#camGuide').hidden = false;
         $('#camCtrl').hidden = false;
@@ -236,10 +250,11 @@
     $('#scannerIdle').hidden = false;
     $('#camGuide').hidden = true;
     $('#camCtrl').hidden = true;
+    $('#camHint').hidden = true;
     $('#btnCam').textContent = 'เปิดกล้อง';
   }
   function resumeCam() {
-    if (camOn && paused) { paused = false; $('#camGuide').classList.remove('hit'); scanLoop(); }
+    if (camOn && paused) { paused = false; cam.since = Date.now(); $('#camGuide').classList.remove('hit'); scanLoop(); }
   }
 
   // decode the guide-box region of the visible (object-fit: cover, digitally zoomed) frame
@@ -261,12 +276,14 @@
         var hit = await detectIn(frameCanvas);
         if (hit && camOn && !paused) {
           paused = true;
+          $('#camHint').hidden = true;
           $('#camGuide').classList.add('hit');
           handleRaw(hit.rawValue, String(hit.format || '').toUpperCase());
           return;
         }
       } catch (e) { /* keep scanning */ }
     }
+    $('#camHint').hidden = Date.now() - cam.since < HINT_AFTER;
     cam.timer = setTimeout(scanLoop, 80);
   }
 
@@ -309,25 +326,35 @@
   // release the camera when the app goes to the background (iOS keeps the green dot otherwise)
   document.addEventListener('visibilitychange', function () { if (document.hidden) stopCam(); });
 
-  $('#fileImg').addEventListener('change', async function (e) {
+  // photo path: the phone's camera app (macro + HDR) or an album picture → decode at a few sizes
+  async function decodePhoto(f) {
+    var bmp = await createImageBitmap(f);
+    var longest = Math.max(bmp.width, bmp.height);
+    var sizes = [Math.min(longest, 2000), longest, 1200].filter(function (v, i, a) { return v <= longest && a.indexOf(v) === i; });
+    for (var i = 0; i < sizes.length; i++) {
+      var k = sizes[i] / longest;
+      var src = k === 1 ? bmp : await createImageBitmap(bmp, { resizeWidth: Math.round(bmp.width * k), resizeHeight: Math.round(bmp.height * k), resizeQuality: 'high' });
+      var hit = await detectIn(src);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  async function onPhotoPicked(e) {
     var f = e.target.files[0]; e.target.value = '';
     if (!f) return;
     if (camOn) await stopCam();
     toast('กำลังอ่านรูป…');
     try { await getDetector(); } catch (err) { return toast(decoderError(err), true); }
     try {
-      var bmp = await createImageBitmap(f);
-      var hit = await detectIn(bmp);
-      if (!hit && Math.max(bmp.width, bmp.height) > 2000) { // very large photos: retry at a moderate size
-        var k = 1600 / Math.max(bmp.width, bmp.height);
-        hit = await detectIn(await createImageBitmap(bmp, { resizeWidth: Math.round(bmp.width * k), resizeHeight: Math.round(bmp.height * k), resizeQuality: 'high' }));
-      }
+      var hit = await decodePhoto(f);
       if (!hit) throw new Error('none');
       handleRaw(hit.rawValue, String(hit.format || '').toUpperCase());
     } catch (err) {
-      toast(err && err.message === 'none' ? 'ไม่พบ QR / บาร์โค้ดในรูปนี้' : 'อ่านรูปไม่ได้: ' + (err && err.message || err), true);
+      toast(err && err.message === 'none' ? 'ไม่พบ QR / บาร์โค้ดในรูปนี้ — ลองถ่ายให้โค้ดเต็มกรอบและไม่มีแสงสะท้อน' : 'อ่านรูปไม่ได้: ' + (err && err.message || err), true);
     }
-  });
+  }
+  $('#fileCam').addEventListener('change', onPhotoPicked);
+  $('#fileImg').addEventListener('change', onPhotoPicked);
 
   $('#manualForm').addEventListener('submit', function (e) {
     e.preventDefault();
@@ -373,7 +400,9 @@
     c.code = R.itemKey(c.type, c.serial, c.lot);
     c.item = byCode[c.code] || null;
     c.product = byType[c.type] || null;
-    c.status = c.item ? 'ok' : 'wait';
+    // answer straight from the synced local copy; only wait for the server if we never synced
+    c.status = c.item || !cfg.url || lastSync ? statusOf(c) : 'wait';
+    c.verifying = !!cfg.url;
     renderResult();
     lookup(log);
   }
@@ -384,6 +413,7 @@
     var c = current;
     if (!c) return;
     if (!cfg.url) { c.status = statusOf(c); c.offline = true; renderResult(); return; }
+    var shown = c.status;
     try {
       var r = await api('scan', { code: c.code, type_code: c.type, raw: c.raw, log: log !== false });
       if (c !== current) return;
@@ -398,8 +428,11 @@
       c.offline = true;
       toast(errText(e) + ' — แสดงจากข้อมูลในเครื่อง', true);
     }
+    c.verifying = false;
     c.status = statusOf(c);
-    renderResult();
+    // re-render only when the answer changed (or for an item, to refresh its scan count) — never wipe a half-filled form
+    if (c.status !== shown || c.status === 'ok' || c.offline) renderResult();
+    else { var vn = $('#verifyNote'); if (vn) vn.remove(); }
   }
 
   function thumb(p, lg) {
@@ -488,6 +521,7 @@
       (c.raw ? '<button class="btn small" type="button" data-act="rule">ตั้งกฎจากโค้ดนี้</button>' : '') +
       '<button class="btn small" type="button" data-act="recode">แก้รหัส</button>' +
       (camOn ? '<button class="btn small primary" type="button" data-act="next">สแกนถัดไป</button>' : '') + '</div>';
+    if (c.verifying && c.status !== 'wait') h += '<p class="small muted" id="verifyNote">ยืนยันกับ Google Sheet…</p>';
     if (c.offline && cfg.url) h += '<p class="small muted">แสดงจากข้อมูลในเครื่อง (ออฟไลน์)</p>';
     if (!cfg.url) h += '<p class="small muted">ยังไม่ได้เชื่อม Google Sheet — ไปที่ <a href="#" data-go="settings">ตั้งค่า</a></p>';
     h += '</div>';
@@ -515,7 +549,14 @@
         toast('บันทึกเข้าคลังแล้ว');
         renderResult();
         if (photo) await uploadPhoto(c.type, photo);
-      } catch (err) { toast(errText(err), true); }
+      } catch (err) {
+        if (err.message === 'duplicate_code' && err.data && err.data.item) {
+          putItem(err.data.item);
+          c.item = err.data.item; c.status = 'ok';
+          renderResult();
+          toast('รายการนี้มีคนบันทึกไว้แล้ว — แสดงข้อมูลที่มีอยู่', true);
+        } else toast(errText(err), true);
+      }
     });
   }
 

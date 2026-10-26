@@ -7,7 +7,7 @@
  *   Products — one row per product type (key: type_code = GTIN for GS1 codes)
  *   Items    — one row per stock unit (key: code = type|SN:serial, type|LOT:lot, or type)
  */
-var VERSION = '1.1.0';
+var VERSION = '1.3.0';
 
 var SHEETS = {
   Products: ['type_code', 'ref', 'name', 'category', 'brand', 'note', 'image_id', 'thumb', 'created_at', 'updated_at'],
@@ -47,8 +47,9 @@ function doPost(e) {
   if (!apiKey || req.key !== apiKey) return json_({ ok: false, error: 'unauthorized' });
 
   try {
+    if (props.getProperty('SCHEMA_OK') !== VERSION) ensureSheets_(); else schemaOk_ = true;
     switch (req.action) {
-      case 'ping': ensureSheets_(); return json_({ ok: true, version: VERSION, sheet: SpreadsheetApp.getActiveSpreadsheet().getUrl() });
+      case 'ping': return json_({ ok: true, version: VERSION, sheet: SpreadsheetApp.getActiveSpreadsheet().getUrl() });
       case 'list': return json_({ ok: true, items: read_('Items').rows, products: read_('Products').rows });
       case 'scan': return json_(withLock_(function () { return scan_(req); }));
       case 'saveItem': return json_(withLock_(function () { return saveItem_(req); }));
@@ -72,22 +73,20 @@ function doPost(e) {
 function scan_(req) {
   var code = clean_(req.code);
   if (!code) return { ok: false, error: 'empty_code' };
-  var items = read_('Items');
-  var idx = items.index[code];
+  var hit = find_('Items', code);
   var item = null;
-  if (idx !== undefined) {
+  if (hit) {
     var now = new Date();
     var c = colMap_('Items');
-    var count = Number(items.rows[idx].scan_count || 0) + 1;
-    items.sheet.getRange(idx + 2, c.scan_count + 1).setValue(count);
-    items.sheet.getRange(idx + 2, c.last_scan + 1).setValue(now);
-    item = items.rows[idx];
+    var count = Number(hit.obj.scan_count || 0) + 1;
+    hit.sheet.getRange(hit.idx + 2, c.scan_count + 1, 1, 2).setValues([[count, now]]); // scan_count, last_scan are adjacent
+    item = hit.obj;
     item.scan_count = count;
     item.last_scan = now.toISOString();
   }
-  var products = read_('Products');
   var type = clean_(req.type_code || (item && item.type_code));
-  var product = products.index[type] !== undefined ? products.rows[products.index[type]] : null;
+  var ph = type ? find_('Products', type) : null;
+  var product = ph ? ph.obj : null;
   if (req.log !== false) log_('scan', code, req.raw, item ? 'พบในคลัง' : product ? 'รุ่นนี้มีแล้ว · ชิ้นใหม่' : 'ยังไม่ลงทะเบียน', req.device);
   return { ok: true, item: item, product: product };
 }
@@ -100,10 +99,10 @@ function saveItem_(req) {
   var product = null;
   if (req.product) product = upsertProduct_(req.product, req.device);
 
-  var data = read_('Items');
-  var idx = data.index[code];
-  if (idx !== undefined && req.mode === 'create') return { ok: false, error: 'duplicate_code' };
-  var cur = idx !== undefined ? data.rows[idx] : {};
+  var hit = find_('Items', code);
+  var idx = hit ? hit.idx : undefined;
+  if (hit && req.mode === 'create') return { ok: false, error: 'duplicate_code', item: hit.obj };
+  var cur = hit ? hit.obj : {};
   var now = new Date();
   var rec = {};
   SHEETS.Items.forEach(function (k) { rec[k] = it[k] !== undefined && it[k] !== null ? it[k] : (cur[k] !== undefined ? cur[k] : ''); });
@@ -122,8 +121,8 @@ function saveItem_(req) {
   if (it.note && it.note !== cur.note) detail += ' · note: ' + String(it.note).slice(0, 200);
   log_(idx !== undefined ? 'update' : 'create', code, it.raw_sample || '', detail, req.device);
   if (!product) {
-    var p = read_('Products');
-    product = p.index[type] !== undefined ? p.rows[p.index[type]] : null;
+    var ph = find_('Products', type);
+    product = ph ? ph.obj : null;
   }
   return { ok: true, item: serialize_(rec), product: product };
 }
@@ -131,9 +130,9 @@ function saveItem_(req) {
 function upsertProduct_(pr, device) {
   var type = clean_(pr.type_code);
   if (!type) throw new Error('empty_code');
-  var data = read_('Products');
-  var idx = data.index[type];
-  var cur = idx !== undefined ? data.rows[idx] : {};
+  var hit = find_('Products', type);
+  var idx = hit ? hit.idx : undefined;
+  var cur = hit ? hit.obj : {};
   var now = new Date();
   var rec = {};
   SHEETS.Products.forEach(function (k) { rec[k] = pr[k] !== undefined && pr[k] !== null ? pr[k] : (cur[k] !== undefined ? cur[k] : ''); });
@@ -147,32 +146,28 @@ function upsertProduct_(pr, device) {
 
 function removeItem_(req) {
   var code = clean_(req.code);
-  var data = read_('Items');
-  var idx = data.index[code];
-  if (idx === undefined) return { ok: false, error: 'not_found' };
-  data.sheet.deleteRow(idx + 2);
+  var hit = find_('Items', code);
+  if (!hit) return { ok: false, error: 'not_found' };
+  hit.sheet.deleteRow(hit.idx + 2);
   log_('delete', code, '', 'ลบออกจากคลัง', req.device);
   return { ok: true };
 }
 
 function removeProduct_(req) {
   var type = clean_(req.type_code);
-  var items = read_('Items');
-  for (var i = 0; i < items.rows.length; i++) if (items.rows[i].type_code === type) return { ok: false, error: 'has_items' };
-  var data = read_('Products');
-  var idx = data.index[type];
-  if (idx === undefined) return { ok: false, error: 'not_found' };
-  deleteImage_(data.rows[idx].image_id);
-  data.sheet.deleteRow(idx + 2);
+  if (find_('Items', type, 'type_code')) return { ok: false, error: 'has_items' };
+  var hit = find_('Products', type);
+  if (!hit) return { ok: false, error: 'not_found' };
+  deleteImage_(hit.obj.image_id);
+  hit.sheet.deleteRow(hit.idx + 2);
   log_('product_delete', type, '', 'ลบประเภท', req.device);
   return { ok: true };
 }
 
 function uploadImage_(req) {
   var type = clean_(req.type_code);
-  var data = read_('Products');
-  var idx = data.index[type];
-  if (idx === undefined) return { ok: false, error: 'not_found' };
+  var hit = find_('Products', type);
+  if (!hit) return { ok: false, error: 'not_found' };
   var b64 = String(req.data || '');
   if (!b64 || b64.length > MAX_IMAGE_CHARS || !/^[A-Za-z0-9+/=]+$/.test(b64)) return { ok: false, error: 'bad_image' };
   var thumb = String(req.thumb || '');
@@ -181,11 +176,10 @@ function uploadImage_(req) {
   var rows = [];
   for (var i = 0, seq = 1; i < b64.length; i += CHUNK, seq++) rows.push([id, seq, type, 'image/jpeg', b64.slice(i, i + CHUNK)]);
   appendRows_('Images', rows);
-  deleteImage_(data.rows[idx].image_id);
+  deleteImage_(hit.obj.image_id);
   var c = colMap_('Products');
-  data.sheet.getRange(idx + 2, c.image_id + 1).setValue(id);
-  data.sheet.getRange(idx + 2, c.thumb + 1).setValue(thumb);
-  data.sheet.getRange(idx + 2, c.updated_at + 1).setValue(new Date());
+  hit.sheet.getRange(hit.idx + 2, c.image_id + 1, 1, 2).setValues([[id, thumb]]); // image_id, thumb are adjacent
+  hit.sheet.getRange(hit.idx + 2, c.updated_at + 1).setValue(new Date());
   log_('product_image', type, '', 'อัปโหลดรูป', req.device);
   return { ok: true, image_id: id, thumb: thumb };
 }
@@ -234,17 +228,24 @@ function history_(code, limit) {
 /* ---------- sheet helpers ---------- */
 
 function ensureSheets_() {
+  schemaOk_ = false;
   Object.keys(SHEETS).forEach(function (name) { sheet_(name); });
+  PropertiesService.getScriptProperties().setProperty('SCHEMA_OK', VERSION);
+  schemaOk_ = true;
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var def = ss.getSheetByName('Sheet1') || ss.getSheetByName('ชีต1');
   if (def && ss.getSheets().length > 1 && def.getLastRow() === 0) ss.deleteSheet(def);
 }
 
 var sheetCache_ = {};
+var schemaOk_ = null;
 function sheet_(name) {
   if (sheetCache_[name]) return sheetCache_[name];
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sh = ss.getSheetByName(name);
+  // header check costs one read per sheet per request — skip it once this VERSION has verified the layout
+  if (schemaOk_ === null) schemaOk_ = PropertiesService.getScriptProperties().getProperty('SCHEMA_OK') === VERSION;
+  if (sh && schemaOk_) return (sheetCache_[name] = sh);
   var cols = SHEETS[name];
   if (sh) {
     var head = sh.getRange(1, 1, 1, sh.getLastColumn() || 1).getValues()[0].slice(0, cols.length).join('|');
@@ -325,6 +326,22 @@ function read_(name) {
     });
   }
   return { sheet: sh, rows: rows, index: index };
+}
+
+// one row by exact key (default: first column) without reading the whole sheet
+// -> {sheet, idx (0-based data row), obj} or null
+function find_(name, key, col) {
+  key = clean_(key);
+  if (!key) return null;
+  var sh = sheet_(name);
+  var n = sh.getLastRow() - 1;
+  if (n < 1) return null;
+  var ci = col ? SHEETS[name].indexOf(col) : 0;
+  var cell = sh.getRange(2, ci + 1, n, 1).createTextFinder(key).matchEntireCell(true).matchCase(true).findNext();
+  if (!cell) return null;
+  var idx = cell.getRow() - 2;
+  var vals = sh.getRange(idx + 2, 1, 1, SHEETS[name].length).getValues()[0];
+  return { sheet: sh, idx: idx, obj: rowObj_(SHEETS[name], vals) };
 }
 
 function rowObj_(cols, r) {
