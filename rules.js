@@ -34,7 +34,9 @@
     return null;
   }
 
-  var GS = '\u001d';
+  // GS1 character set 82; anything else inside an element string is treated as an FNC1 separator
+  var SEP_RE = /[^!"%&'()*+,\-./0-9:;<=>?A-Z_a-z]/;
+  function isSep(ch) { return SEP_RE.test(ch); }
   function stripSymbology(raw) { return String(raw).replace(/^\](C1|e0|d2|Q3|J1)/, ''); }
 
   // returns {fields:[{ai,name,value}], ok:boolean} or null if it does not look like GS1
@@ -73,22 +75,24 @@
       }
       return fields.length ? { fields: fields, ok: true } : null;
     }
-    // Raw element string (FNC1 = GS char). Only accept when it starts with a known AI and parses cleanly.
+    // Raw element string. FNC1 normally arrives as GS (\u001d), but some scanners/phones turn it into
+    // another char (seen: "Ï") — so any char outside GS1 character set 82 counts as a separator.
     if (!/^\d{2}/.test(s)) return null;
-    var hadPrefix = /^\](C1|e0|d2|Q3|J1)/.test(String(raw)) || s.indexOf(GS) >= 0;
+    // strong signal = symbology id or a real GS; a substitute separator still needs the structure check below
+    var hadPrefix = /^\](C1|e0|d2|Q3|J1)/.test(String(raw)) || s.indexOf('\u001d') >= 0;
     var out = [], i = 0;
     while (i < s.length) {
-      if (s[i] === GS) { i++; continue; }
+      if (isSep(s[i])) { i++; continue; }
       var hit = lookupAI(s, i);
       if (!hit) return out.length ? { fields: out, ok: false, rest: s.slice(i) } : null;
       i += hit.ai.length;
       var val;
       if (hit.def[1]) { val = s.substr(i, hit.def[1]); i += hit.def[1]; }
       else {
-        var end = s.indexOf(GS, i);
-        if (end < 0) end = s.length;
-        val = s.slice(i, Math.min(end, i + hit.def[2]));
-        i += val.length;
+        var end = i;
+        while (end < s.length && end < i + hit.def[2] && !isSep(s[end])) end++;
+        val = s.slice(i, end);
+        i = end;
       }
       out.push({ ai: hit.ai, name: hit.def[0], value: val });
     }

@@ -1,7 +1,7 @@
 /* QR Stock — UI */
 (function () {
   'use strict';
-  var APP_VERSION = '1.0.0';
+  var APP_VERSION = '1.0.1';
   var SETUP_PREFIX = 'QRSTOCK-SETUP:';
   var R = window.QRRules;
 
