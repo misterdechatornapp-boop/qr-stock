@@ -22,7 +22,15 @@
   <!-- ============ SCAN ============ -->
   <section class="view" id="view-scan">
     <div class="scanner-wrap">
-      <div id="reader"></div>
+      <div id="reader"><video id="camVideo" playsinline muted autoplay></video></div>
+      <div class="guide" id="camGuide" hidden></div>
+      <div class="cam-ctrl" id="camCtrl" hidden>
+        <span class="zoom-label" id="zoomLabel">1×</span>
+        <input type="range" id="zoomRange" min="1" max="4" step="0.1" value="1" aria-label="ซูม">
+        <button type="button" class="cam-btn" id="btnTorch" aria-label="ไฟฉาย" aria-pressed="false" hidden>
+          <svg viewBox="0 0 24 24" width="22" height="22"><path d="M8 2h8l-1 6h-6zM9 8h6v3l-1.5 2v9h-3v-9L9 11z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
       <div class="scanner-idle" id="scannerIdle">
         <svg viewBox="0 0 24 24" width="40" height="40"><path d="M4 7V5a1 1 0 0 1 1-1h2M17 4h2a1 1 0 0 1 1 1v2M20 17v2a1 1 0 0 1-1 1h-2M7 20H5a1 1 0 0 1-1-1v-2M7 12h10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
         <p>กดเปิดกล้องเพื่อสแกน QR / บาร์โค้ด</p>
@@ -113,7 +121,6 @@
 <dialog id="dlg"><form method="dialog" id="dlgForm"></form></dialog>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
-<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <script src="rules.js"></script>
 <script src="app.js"></script>
 </body>

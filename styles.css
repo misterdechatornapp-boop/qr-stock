@@ -128,8 +128,23 @@ label.check input { width: 20px; min-height: 20px; height: 20px; accent-color: v
   position: relative; border-radius: var(--radius); overflow: hidden;
   background: #0b1110; aspect-ratio: 4 / 3; max-height: 52vh; width: 100%;
 }
-#reader { width: 100%; height: 100%; }
-#reader video { width: 100% !important; height: 100% !important; object-fit: cover; }
+#reader { width: 100%; height: 100%; overflow: hidden; }
+#reader video { width: 100%; height: 100%; object-fit: cover; transform-origin: center; display: block; }
+/* scan area — the same fraction of the visible frame that gets decoded (see SCAN_BOX in app.js) */
+.guide {
+  position: absolute; left: 7%; top: 12%; width: 86%; height: 76%; pointer-events: none;
+  border-radius: 14px; box-shadow: 0 0 0 9999px rgba(0,0,0,.28);
+  outline: 2px solid rgba(255,255,255,.85); outline-offset: -2px;
+}
+.guide.hit { outline-color: #2dd4bf; outline-width: 4px; }
+.cam-ctrl {
+  position: absolute; left: 10px; right: 10px; bottom: 10px; display: flex; align-items: center; gap: 10px;
+  padding: 6px 10px; border-radius: 99px; background: rgba(0,0,0,.5); color: #fff; backdrop-filter: blur(6px);
+}
+.cam-ctrl input[type=range] { flex: 1; min-height: 28px; padding: 0; background: none; border: 0; accent-color: #2dd4bf; }
+.zoom-label { font-weight: 700; font-size: 14px; min-width: 38px; text-align: center; }
+.cam-btn { width: 40px; height: 40px; border-radius: 50%; border: 0; background: rgba(255,255,255,.15); color: #fff; display: grid; place-items: center; cursor: pointer; }
+.cam-btn[aria-pressed=true] { background: #facc15; color: #111; }
 .scanner-idle {
   position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: 6px; color: #a7b8b4; text-align: center; padding: 16px;
@@ -241,6 +256,3 @@ dialog::backdrop { background: rgba(0,0,0,.45); }
 }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 .toast.bad { background: var(--bad); color: #fff; }
-
-/* html5-qrcode leaves its own UI bits; hide what we don't use */
-#reader img[alt="Info icon"], #reader__dashboard_section_csr span { display: none !important; }

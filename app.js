@@ -1,7 +1,7 @@
 /* QR Stock — UI */
 (function () {
   'use strict';
-  var APP_VERSION = '1.1.0';
+  var APP_VERSION = '1.2.0';
   var SETUP_PREFIX = 'QRSTOCK-SETUP:';
   var R = window.QRRules;
 
@@ -145,60 +145,169 @@
   });
 
   /* ---------- camera ---------- */
-  var scanner = null, camOn = false, paused = false;
-  function getScanner() {
-    if (!scanner) {
-      if (!window.Html5Qrcode) { toast('โหลดตัวสแกนไม่สำเร็จ ตรวจอินเทอร์เน็ต', true); return null; }
-      scanner = new Html5Qrcode('reader', { verbose: false, useBarCodeDetectorIfSupported: true });
+  // Decoder: zxing-cpp (WebAssembly) behind the BarcodeDetector API. It reads small / glossy DataMatrix
+  // labels that the old zxing-js engine missed. The module + wasm load once from jsDelivr.
+  var DETECTOR_URL = 'https://cdn.jsdelivr.net/npm/barcode-detector@3.2.2/+esm';
+  var FORMATS = ['data_matrix', 'qr_code', 'micro_qr_code', 'code_128', 'code_39', 'code_93', 'codabar', 'ean_13', 'ean_8',
+    'upc_a', 'upc_e', 'itf', 'pdf417', 'aztec', 'databar', 'databar_expanded'];
+  var detectorP = null;
+  function getDetector() {
+    if (!detectorP) {
+      detectorP = import(DETECTOR_URL).then(function (m) {
+        var BD = m.BarcodeDetector;
+        return BD.getSupportedFormats().then(function (sup) {
+          return new BD({ formats: FORMATS.filter(function (f) { return sup.indexOf(f) >= 0; }) });
+        });
+      });
+      detectorP.catch(function () { detectorP = null; }); // allow a retry after a network failure
     }
-    return scanner;
+    return detectorP;
   }
+  async function detectIn(source) {
+    var det = await getDetector();
+    var r = await det.detect(source);
+    return r && r.length ? r[0] : null;
+  }
+
+  var SCAN_BOX = { x: 0.07, y: 0.12, w: 0.86, h: 0.76 }; // must match .guide in styles.css
+  var MAX_DECODE = 1600; // px, longest side handed to the decoder per frame
+  var cam = { stream: null, track: null, hwZoom: null, zoom: 1, torch: false, timer: 0 };
+  var camOn = false, paused = false;
+  var video = $('#camVideo');
+  var frameCanvas = document.createElement('canvas');
+
   async function startCam() {
-    var s = getScanner(); if (!s) return;
     var btn = $('#btnCam');
     await busy(btn, async function () {
       try {
-        await s.start({ facingMode: 'environment' }, {
-          fps: 12,
-          qrbox: function (w, h) { return { width: Math.floor(Math.min(w * 0.86, 420)), height: Math.floor(Math.min(h * 0.62, 260)) }; }
-        }, onCamDecode, function () {});
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('เบราว์เซอร์นี้ไม่รองรับกล้อง (ต้องเปิดผ่าน https)');
+        var detP = getDetector(); // start loading the decoder while the camera warms up
+        cam.stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+        });
+        cam.track = cam.stream.getVideoTracks()[0];
+        video.srcObject = cam.stream;
+        await video.play();
+        await detP;
+        setupCamControls();
         camOn = true; paused = false;
         $('#scannerIdle').hidden = true;
+        $('#camGuide').hidden = false;
+        $('#camCtrl').hidden = false;
+        scanLoop();
       } catch (e) {
-        toast('เปิดกล้องไม่ได้: ' + (e && e.message ? e.message : e), true);
+        stopStream();
+        var msg = e && e.name === 'NotAllowedError' ? 'ไม่ได้รับอนุญาตให้ใช้กล้อง — เปิดสิทธิ์กล้องให้เว็บนี้ในการตั้งค่าเบราว์เซอร์'
+          : e && /import|fetch|module/i.test(String(e.message || e)) ? 'โหลดตัวอ่านบาร์โค้ดไม่สำเร็จ ตรวจอินเทอร์เน็ต'
+          : 'เปิดกล้องไม่ได้: ' + (e && e.message ? e.message : e);
+        toast(msg, true);
       }
     });
     btn.textContent = camOn ? 'ปิดกล้อง' : 'เปิดกล้อง';
   }
+  function stopStream() {
+    clearTimeout(cam.timer);
+    if (cam.stream) cam.stream.getTracks().forEach(function (t) { t.stop(); });
+    cam.stream = null; cam.track = null; cam.torch = false;
+    video.srcObject = null;
+  }
   async function stopCam() {
-    if (!scanner || !camOn) return;
-    try { await scanner.stop(); } catch (e) { /* already stopped */ }
+    if (!camOn) return;
+    stopStream();
     camOn = false; paused = false;
     $('#scannerIdle').hidden = false;
+    $('#camGuide').hidden = true;
+    $('#camCtrl').hidden = true;
     $('#btnCam').textContent = 'เปิดกล้อง';
   }
   function resumeCam() {
-    if (scanner && camOn && paused) { try { scanner.resume(); } catch (e) { /* ignore */ } paused = false; }
+    if (camOn && paused) { paused = false; $('#camGuide').classList.remove('hit'); scanLoop(); }
   }
-  function onCamDecode(text, result) {
-    if (paused) return;
-    var fmt = result && result.result && result.result.format ? result.result.format.formatName : '';
-    try { scanner.pause(true); paused = true; } catch (e) { /* ignore */ }
-    handleRaw(text, fmt);
+
+  // decode the guide-box region of the visible (object-fit: cover, digitally zoomed) frame
+  async function scanLoop() {
+    clearTimeout(cam.timer);
+    if (!camOn || paused) return;
+    var vw = video.videoWidth, vh = video.videoHeight;
+    if (vw && vh) {
+      var box = video.parentNode.getBoundingClientRect();
+      var digital = cam.hwZoom ? 1 : cam.zoom;
+      var scale = Math.max(box.width / vw, box.height / vh) * digital;
+      var visW = box.width / scale, visH = box.height / scale;
+      var sx = (vw - visW) / 2 + visW * SCAN_BOX.x, sy = (vh - visH) / 2 + visH * SCAN_BOX.y;
+      var sw = visW * SCAN_BOX.w, sh = visH * SCAN_BOX.h;
+      var k = Math.min(1, MAX_DECODE / Math.max(sw, sh));
+      frameCanvas.width = Math.round(sw * k); frameCanvas.height = Math.round(sh * k);
+      frameCanvas.getContext('2d').drawImage(video, sx, sy, sw, sh, 0, 0, frameCanvas.width, frameCanvas.height);
+      try {
+        var hit = await detectIn(frameCanvas);
+        if (hit && camOn && !paused) {
+          paused = true;
+          $('#camGuide').classList.add('hit');
+          handleRaw(hit.rawValue, String(hit.format || '').toUpperCase());
+          return;
+        }
+      } catch (e) { /* keep scanning */ }
+    }
+    cam.timer = setTimeout(scanLoop, 80);
   }
+
+  // zoom: real optical/sensor zoom when the camera exposes it, otherwise a digital crop of the 1080p frame
+  function setupCamControls() {
+    var caps = cam.track && cam.track.getCapabilities ? cam.track.getCapabilities() : {};
+    var range = $('#zoomRange');
+    cam.hwZoom = caps.zoom && caps.zoom.max > caps.zoom.min ? caps.zoom : null;
+    if (cam.hwZoom) {
+      range.min = cam.hwZoom.min; range.max = Math.min(cam.hwZoom.max, 8); range.step = cam.hwZoom.step || 0.1;
+    } else { range.min = 1; range.max = 4; range.step = 0.1; }
+    range.value = cam.hwZoom ? Math.max(cam.hwZoom.min, Math.min(cam.zoom, range.max)) : cam.zoom;
+    applyZoom(Number(range.value));
+    $('#btnTorch').hidden = !caps.torch;
+    $('#btnTorch').setAttribute('aria-pressed', 'false');
+    if (caps.focusMode && caps.focusMode.indexOf('continuous') >= 0) {
+      cam.track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(function () {});
+    }
+  }
+  function applyZoom(z) {
+    cam.zoom = z;
+    $('#zoomLabel').textContent = (Math.round(z * 10) / 10) + '×';
+    if (cam.hwZoom && cam.track) {
+      video.style.transform = '';
+      cam.track.applyConstraints({ advanced: [{ zoom: z }] }).catch(function () {});
+    } else {
+      video.style.transform = z > 1 ? 'scale(' + z + ')' : '';
+    }
+  }
+  $('#zoomRange').addEventListener('input', function () { applyZoom(Number(this.value)); });
+  $('#btnTorch').addEventListener('click', function () {
+    var b = this;
+    if (!cam.track) return;
+    cam.torch = !cam.torch;
+    cam.track.applyConstraints({ advanced: [{ torch: cam.torch }] })
+      .then(function () { b.setAttribute('aria-pressed', String(cam.torch)); })
+      .catch(function () { cam.torch = false; b.setAttribute('aria-pressed', 'false'); toast('เปิดไฟฉายไม่ได้', true); });
+  });
   $('#btnCam').addEventListener('click', function () { camOn ? stopCam() : startCam(); });
+  // release the camera when the app goes to the background (iOS keeps the green dot otherwise)
+  document.addEventListener('visibilitychange', function () { if (document.hidden) stopCam(); });
 
   $('#fileImg').addEventListener('change', async function (e) {
     var f = e.target.files[0]; e.target.value = '';
     if (!f) return;
-    var s = getScanner(); if (!s) return;
     if (camOn) await stopCam();
+    toast('กำลังอ่านรูป…');
     try {
-      var r = s.scanFileV2 ? await s.scanFileV2(f, false) : { decodedText: await s.scanFile(f, false) };
-      var fmt = r.result && r.result.format ? r.result.format.formatName : '';
-      handleRaw(r.decodedText, fmt);
+      var bmp = await createImageBitmap(f);
+      var hit = await detectIn(bmp);
+      if (!hit && Math.max(bmp.width, bmp.height) > 2000) { // very large photos: retry at a moderate size
+        var k = 1600 / Math.max(bmp.width, bmp.height);
+        hit = await detectIn(await createImageBitmap(bmp, { resizeWidth: Math.round(bmp.width * k), resizeHeight: Math.round(bmp.height * k), resizeQuality: 'high' }));
+      }
+      if (!hit) throw new Error('none');
+      handleRaw(hit.rawValue, String(hit.format || '').toUpperCase());
     } catch (err) {
-      toast('ไม่พบ QR / บาร์โค้ดในรูปนี้', true);
+      toast(/import|fetch|module/i.test(String(err && err.message)) ? 'โหลดตัวอ่านบาร์โค้ดไม่สำเร็จ ตรวจอินเทอร์เน็ต' : 'ไม่พบ QR / บาร์โค้ดในรูปนี้', true);
     }
   });
 
