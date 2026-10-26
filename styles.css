@@ -186,6 +186,30 @@ details summary { cursor: pointer; color: var(--muted); font-size: 14px; }
 .history li { padding: 6px 0; border-top: 1px solid var(--line); }
 .history b { font-weight: 600; }
 
+/* two-level stock */
+.seg { display: grid; grid-template-columns: 1fr 1fr; background: var(--surface-2); border-radius: 12px; padding: 4px; gap: 4px; }
+.seg button { min-height: 38px; border: 0; border-radius: 9px; background: none; color: var(--muted); font: inherit; font-weight: 600; cursor: pointer; }
+.seg button.on { background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
+.thumb {
+  width: 48px; height: 48px; flex: none; border-radius: 10px; object-fit: cover;
+  background: var(--surface-2); display: grid; place-items: center; color: var(--muted); font-size: 20px;
+}
+.thumb.lg { width: 72px; height: 72px; }
+.product-head { display: flex; gap: 12px; align-items: center; }
+.product-head .t { font-weight: 700; font-size: 17px; }
+.section-label { font-size: 13px; font-weight: 700; color: var(--muted); text-transform: none; margin: 4px 0 -4px; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 12px; font-weight: 700; }
+.badge.bad { background: var(--bad-soft); color: var(--bad); }
+.badge.warn { background: var(--warn-soft); color: var(--warn); }
+.badge.ok { background: var(--ok-soft); color: var(--ok); }
+.photo-full { width: 100%; max-height: 320px; object-fit: contain; border-radius: 12px; background: var(--surface-2); }
+.qty-row { display: flex; align-items: center; gap: 8px; }
+.qty-row .btn { width: 44px; padding: 0; font-size: 20px; }
+.qty-row b { min-width: 60px; text-align: center; font-size: 20px; }
+.role-chip { font-size: 11px; padding: 1px 6px; border-radius: 6px; background: var(--surface-2); color: var(--muted); margin-left: 4px; font-weight: 600; }
+.sub-list { list-style: none; margin: 0; padding: 0; font-size: 14px; }
+.sub-list li { padding: 8px 0; border-top: 1px solid var(--line); display: flex; justify-content: space-between; gap: 8px; cursor: pointer; }
+
 /* tabs */
 .tabs {
   position: fixed; bottom: 0; left: 0; right: 0; z-index: 6;

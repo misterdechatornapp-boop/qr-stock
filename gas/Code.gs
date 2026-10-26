@@ -1,17 +1,31 @@
 /**
  * QR Stock — backend (Google Apps Script, bound to the "QR Stock" spreadsheet)
- * Web app: execute as owner, access anyone. Every call (except init/ping) must carry API_KEY.
+ * Web app: execute as owner, access anyone. Every call (except init) must carry API_KEY.
  * API_KEY lives in Script Properties only — never in the repo.
+ *
+ * Two levels:
+ *   Products — one row per product type (key: type_code = GTIN for GS1 codes)
+ *   Items    — one row per stock unit (key: code = type|SN:serial, type|LOT:lot, or type)
  */
-var VERSION = '1.0.0';
+var VERSION = '1.1.0';
 
 var SHEETS = {
-  Items: ['code', 'name', 'note', 'qty', 'unit', 'location', 'format', 'raw_sample', 'created_at', 'updated_at', 'scan_count', 'last_scan'],
+  Products: ['type_code', 'ref', 'name', 'category', 'brand', 'note', 'image_id', 'thumb', 'created_at', 'updated_at'],
+  Items: ['code', 'type_code', 'serial', 'lot', 'ref', 'mfg_date', 'exp_date', 'qty', 'unit', 'location', 'note', 'fields', 'format', 'raw_sample', 'created_at', 'updated_at', 'scan_count', 'last_scan'],
   Log: ['ts', 'action', 'code', 'raw', 'detail', 'device'],
-  Config: ['key', 'value']
+  Config: ['key', 'value'],
+  Images: ['image_id', 'seq', 'type_code', 'mime', 'data'] // photo base64 split into ≤45k-char chunks (cell limit 50k)
 };
-// columns that must stay text (barcodes lose leading zeros otherwise)
-var TEXT_COLS = { Items: ['code', 'raw_sample'], Log: ['code', 'raw'], Config: ['key', 'value'] };
+// columns that must stay text (barcodes lose leading zeros, dates get reinterpreted otherwise)
+var TEXT_COLS = {
+  Products: ['type_code', 'ref'],
+  Items: ['code', 'type_code', 'serial', 'lot', 'ref', 'mfg_date', 'exp_date', 'fields', 'raw_sample'],
+  Log: ['code', 'raw'],
+  Config: ['key', 'value'],
+  Images: ['image_id', 'type_code', 'data']
+};
+var CHUNK = 45000;
+var MAX_IMAGE_CHARS = 600000; // ~450 KB jpeg
 
 function doGet() {
   return json_({ ok: true, app: 'qr-stock', version: VERSION });
@@ -34,14 +48,18 @@ function doPost(e) {
 
   try {
     switch (req.action) {
-      case 'ping': return json_({ ok: true, version: VERSION, sheet: SpreadsheetApp.getActiveSpreadsheet().getUrl() });
-      case 'list': return json_({ ok: true, items: readItems_().items });
+      case 'ping': ensureSheets_(); return json_({ ok: true, version: VERSION, sheet: SpreadsheetApp.getActiveSpreadsheet().getUrl() });
+      case 'list': return json_({ ok: true, items: read_('Items').rows, products: read_('Products').rows });
       case 'scan': return json_(withLock_(function () { return scan_(req); }));
-      case 'save': return json_(withLock_(function () { return save_(req); }));
-      case 'remove': return json_(withLock_(function () { return remove_(req); }));
+      case 'saveItem': return json_(withLock_(function () { return saveItem_(req); }));
+      case 'saveProduct': return json_(withLock_(function () { return { ok: true, product: upsertProduct_(req.product || {}, req.device) }; }));
+      case 'removeItem': return json_(withLock_(function () { return removeItem_(req); }));
+      case 'removeProduct': return json_(withLock_(function () { return removeProduct_(req); }));
+      case 'uploadImage': return json_(withLock_(function () { return uploadImage_(req); }));
+      case 'image': return json_(image_(req));
       case 'history': return json_({ ok: true, rows: history_(req.code, req.limit || 30) });
-      case 'getRules': return json_({ ok: true, rules: getConfig_('rules') || '[]' });
-      case 'saveRules': return json_(withLock_(function () { setConfig_('rules', req.rules || '[]'); log_('rules', '', '', 'อัปเดตกฎการอ่านค่า', req.device); return { ok: true }; }));
+      case 'getRules': return json_({ ok: true, rules: getConfig_('rules_v2') || '' });
+      case 'saveRules': return json_(withLock_(function () { setConfig_('rules_v2', req.rules || '[]'); log_('rules', '', '', 'อัปเดตกฎการอ่านค่า', req.device); return { ok: true }; }));
       default: return json_({ ok: false, error: 'unknown_action' });
     }
   } catch (err) {
@@ -54,73 +72,150 @@ function doPost(e) {
 function scan_(req) {
   var code = clean_(req.code);
   if (!code) return { ok: false, error: 'empty_code' };
-  var data = readItems_();
-  var idx = data.index[code];
-  var now = new Date();
+  var items = read_('Items');
+  var idx = items.index[code];
   var item = null;
   if (idx !== undefined) {
-    var row = idx + 2;
-    var sh = data.sheet;
+    var now = new Date();
     var c = colMap_('Items');
-    var count = Number(data.items[idx].scan_count || 0) + 1;
-    sh.getRange(row, c.scan_count + 1).setValue(count);
-    sh.getRange(row, c.last_scan + 1).setValue(now);
-    item = data.items[idx];
+    var count = Number(items.rows[idx].scan_count || 0) + 1;
+    items.sheet.getRange(idx + 2, c.scan_count + 1).setValue(count);
+    items.sheet.getRange(idx + 2, c.last_scan + 1).setValue(now);
+    item = items.rows[idx];
     item.scan_count = count;
     item.last_scan = now.toISOString();
   }
-  if (req.log !== false) log_('scan', code, req.raw, item ? 'พบในคลัง' : 'ยังไม่ลงทะเบียน', req.device);
-  return { ok: true, item: item };
+  var products = read_('Products');
+  var type = clean_(req.type_code || (item && item.type_code));
+  var product = products.index[type] !== undefined ? products.rows[products.index[type]] : null;
+  if (req.log !== false) log_('scan', code, req.raw, item ? 'พบในคลัง' : product ? 'รุ่นนี้มีแล้ว · ชิ้นใหม่' : 'ยังไม่ลงทะเบียน', req.device);
+  return { ok: true, item: item, product: product };
 }
 
-function save_(req) {
+function saveItem_(req) {
   var it = req.item || {};
   var code = clean_(it.code);
-  if (!code) return { ok: false, error: 'empty_code' };
-  var orig = clean_(req.originalCode || '');
-  var data = readItems_();
-  var sh = data.sheet;
+  var type = clean_(it.type_code);
+  if (!code || !type) return { ok: false, error: 'empty_code' };
+  var product = null;
+  if (req.product) product = upsertProduct_(req.product, req.device);
+
+  var data = read_('Items');
+  var idx = data.index[code];
+  if (idx !== undefined && req.mode === 'create') return { ok: false, error: 'duplicate_code' };
+  var cur = idx !== undefined ? data.rows[idx] : {};
   var now = new Date();
+  var rec = {};
+  SHEETS.Items.forEach(function (k) { rec[k] = it[k] !== undefined && it[k] !== null ? it[k] : (cur[k] !== undefined ? cur[k] : ''); });
+  rec.code = code;
+  rec.type_code = type;
+  rec.qty = rec.qty === '' ? '' : Number(rec.qty);
+  if (typeof rec.fields === 'object') rec.fields = JSON.stringify(rec.fields);
+  rec.created_at = cur.created_at ? new Date(cur.created_at) : now;
+  rec.updated_at = now;
+  rec.scan_count = cur.scan_count || 0;
+  rec.last_scan = cur.last_scan ? new Date(cur.last_scan) : '';
+  writeRow_('Items', idx, rec);
 
-  if (orig && orig !== code && data.index[code] !== undefined) return { ok: false, error: 'duplicate_code' };
-  var idx = data.index[orig || code];
-  if (!orig && idx !== undefined && req.mode === 'create') return { ok: false, error: 'duplicate_code' };
-
-  var cur = idx !== undefined ? data.items[idx] : {};
-  var rec = {
-    code: code,
-    name: str_(it.name, cur.name),
-    note: str_(it.note, cur.note),
-    qty: it.qty === '' || it.qty === undefined || it.qty === null ? (cur.qty === undefined ? '' : cur.qty) : Number(it.qty),
-    unit: str_(it.unit, cur.unit),
-    location: str_(it.location, cur.location),
-    format: str_(it.format, cur.format),
-    raw_sample: str_(it.raw_sample, cur.raw_sample),
-    created_at: cur.created_at ? new Date(cur.created_at) : now,
-    updated_at: now,
-    scan_count: cur.scan_count || 0,
-    last_scan: cur.last_scan ? new Date(cur.last_scan) : ''
-  };
-  var values = [SHEETS.Items.map(function (k) { return rec[k]; })];
-  if (idx !== undefined) {
-    sh.getRange(idx + 2, 1, 1, SHEETS.Items.length).setValues(values);
-  } else {
-    appendRow_('Items', values[0]);
-  }
-  var detail = idx !== undefined ? (orig && orig !== code ? 'เปลี่ยนรหัสจาก ' + orig : 'แก้ไขข้อมูล') : 'ลงทะเบียนใหม่';
+  var detail = idx !== undefined ? 'แก้ไขข้อมูล' : 'ลงทะเบียนใหม่';
+  if (it.qty !== undefined && String(it.qty) !== String(cur.qty === undefined ? '' : cur.qty)) detail += ' · จำนวน ' + (cur.qty === undefined || cur.qty === '' ? '-' : cur.qty) + ' → ' + rec.qty;
   if (it.note && it.note !== cur.note) detail += ' · note: ' + String(it.note).slice(0, 200);
   log_(idx !== undefined ? 'update' : 'create', code, it.raw_sample || '', detail, req.device);
-  return { ok: true, item: serialize_(rec) };
+  if (!product) {
+    var p = read_('Products');
+    product = p.index[type] !== undefined ? p.rows[p.index[type]] : null;
+  }
+  return { ok: true, item: serialize_(rec), product: product };
 }
 
-function remove_(req) {
+function upsertProduct_(pr, device) {
+  var type = clean_(pr.type_code);
+  if (!type) throw new Error('empty_code');
+  var data = read_('Products');
+  var idx = data.index[type];
+  var cur = idx !== undefined ? data.rows[idx] : {};
+  var now = new Date();
+  var rec = {};
+  SHEETS.Products.forEach(function (k) { rec[k] = pr[k] !== undefined && pr[k] !== null ? pr[k] : (cur[k] !== undefined ? cur[k] : ''); });
+  rec.type_code = type;
+  rec.created_at = cur.created_at ? new Date(cur.created_at) : now;
+  rec.updated_at = now;
+  writeRow_('Products', idx, rec);
+  log_(idx !== undefined ? 'product_update' : 'product_create', type, '', (idx !== undefined ? 'แก้ไขประเภท ' : 'สร้างประเภท ') + (rec.name || ''), device);
+  return serialize_(rec);
+}
+
+function removeItem_(req) {
   var code = clean_(req.code);
-  var data = readItems_();
+  var data = read_('Items');
   var idx = data.index[code];
   if (idx === undefined) return { ok: false, error: 'not_found' };
   data.sheet.deleteRow(idx + 2);
   log_('delete', code, '', 'ลบออกจากคลัง', req.device);
   return { ok: true };
+}
+
+function removeProduct_(req) {
+  var type = clean_(req.type_code);
+  var items = read_('Items');
+  for (var i = 0; i < items.rows.length; i++) if (items.rows[i].type_code === type) return { ok: false, error: 'has_items' };
+  var data = read_('Products');
+  var idx = data.index[type];
+  if (idx === undefined) return { ok: false, error: 'not_found' };
+  deleteImage_(data.rows[idx].image_id);
+  data.sheet.deleteRow(idx + 2);
+  log_('product_delete', type, '', 'ลบประเภท', req.device);
+  return { ok: true };
+}
+
+function uploadImage_(req) {
+  var type = clean_(req.type_code);
+  var data = read_('Products');
+  var idx = data.index[type];
+  if (idx === undefined) return { ok: false, error: 'not_found' };
+  var b64 = String(req.data || '');
+  if (!b64 || b64.length > MAX_IMAGE_CHARS || !/^[A-Za-z0-9+/=]+$/.test(b64)) return { ok: false, error: 'bad_image' };
+  var thumb = String(req.thumb || '');
+  if (!/^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(thumb) || thumb.length > CHUNK) thumb = '';
+  var id = Utilities.getUuid();
+  var rows = [];
+  for (var i = 0, seq = 1; i < b64.length; i += CHUNK, seq++) rows.push([id, seq, type, 'image/jpeg', b64.slice(i, i + CHUNK)]);
+  appendRows_('Images', rows);
+  deleteImage_(data.rows[idx].image_id);
+  var c = colMap_('Products');
+  data.sheet.getRange(idx + 2, c.image_id + 1).setValue(id);
+  data.sheet.getRange(idx + 2, c.thumb + 1).setValue(thumb);
+  data.sheet.getRange(idx + 2, c.updated_at + 1).setValue(new Date());
+  log_('product_image', type, '', 'อัปโหลดรูป', req.device);
+  return { ok: true, image_id: id, thumb: thumb };
+}
+
+function image_(req) {
+  var id = clean_(req.id);
+  if (!id) return { ok: false, error: 'not_found' };
+  var parts = imageRows_(id);
+  if (!parts.length) return { ok: false, error: 'not_found' };
+  parts.sort(function (a, b) { return a.seq - b.seq; });
+  return { ok: true, mime: parts[0].mime, data: parts.map(function (p) { return p.data; }).join('') };
+}
+
+// -> [{row, seq, mime, data}] for one image id
+function imageRows_(id) {
+  var sh = sheet_('Images');
+  var n = sh.getLastRow() - 1;
+  if (n < 1 || !id) return [];
+  var out = [];
+  sh.getRange(2, 1, n, SHEETS.Images.length).getValues().forEach(function (r, i) {
+    if (String(r[0]) === id) out.push({ row: i + 2, seq: Number(r[1]), mime: r[3], data: String(r[4]) });
+  });
+  return out;
+}
+
+function deleteImage_(id) {
+  if (!id) return;
+  var sh = sheet_('Images');
+  imageRows_(id).map(function (p) { return p.row; }).sort(function (a, b) { return b - a; })
+    .forEach(function (row) { sh.deleteRow(row); });
 }
 
 function history_(code, limit) {
@@ -145,18 +240,33 @@ function ensureSheets_() {
   if (def && ss.getSheets().length > 1 && def.getLastRow() === 0) ss.deleteSheet(def);
 }
 
+var sheetCache_ = {};
 function sheet_(name) {
+  if (sheetCache_[name]) return sheetCache_[name];
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sh = ss.getSheetByName(name);
-  if (!sh) {
-    sh = ss.insertSheet(name);
-    sh.getRange(1, 1, 1, SHEETS[name].length).setValues([SHEETS[name]]).setFontWeight('bold');
-    sh.setFrozenRows(1);
-    (TEXT_COLS[name] || []).forEach(function (k) {
-      sh.getRange(1, SHEETS[name].indexOf(k) + 1, sh.getMaxRows(), 1).setNumberFormat('@');
-    });
+  var cols = SHEETS[name];
+  if (sh) {
+    var head = sh.getRange(1, 1, 1, sh.getLastColumn() || 1).getValues()[0].slice(0, cols.length).join('|');
+    if (head !== cols.join('|')) {
+      if (sh.getLastRow() <= 1) { sh.clear(); formatSheet_(sh, name); }
+      else { // older layout with data: keep it aside, start a fresh sheet
+        sh.setName(name + '_old_' + Utilities.formatDate(new Date(), 'Asia/Bangkok', 'yyyyMMdd_HHmm'));
+        sh = null;
+      }
+    }
   }
+  if (!sh) { sh = ss.insertSheet(name); formatSheet_(sh, name); }
+  sheetCache_[name] = sh;
   return sh;
+}
+
+function formatSheet_(sh, name) {
+  sh.getRange(1, 1, 1, SHEETS[name].length).setValues([SHEETS[name]]).setFontWeight('bold');
+  sh.setFrozenRows(1);
+  (TEXT_COLS[name] || []).forEach(function (k) {
+    sh.getRange(1, SHEETS[name].indexOf(k) + 1, sh.getMaxRows(), 1).setNumberFormat('@');
+  });
 }
 
 // append one row, growing the grid (with text formatting) when it is full
@@ -172,36 +282,60 @@ function appendRow_(name, row) {
   sh.getRange(next, 1, 1, row.length).setValues([row]);
 }
 
+function appendRows_(name, rows) {
+  if (!rows.length) return;
+  var sh = sheet_(name);
+  var next = sh.getLastRow() + 1;
+  var need = next + rows.length - 1 - sh.getMaxRows();
+  if (need > 0) {
+    var add = Math.max(need, 500);
+    var from = sh.getMaxRows() + 1;
+    sh.insertRowsAfter(sh.getMaxRows(), add);
+    (TEXT_COLS[name] || []).forEach(function (k) {
+      sh.getRange(from, SHEETS[name].indexOf(k) + 1, add, 1).setNumberFormat('@');
+    });
+  }
+  sh.getRange(next, 1, rows.length, rows[0].length).setValues(rows);
+}
+
+function writeRow_(name, idx, rec) {
+  var row = SHEETS[name].map(function (k) { return rec[k]; });
+  if (idx !== undefined) sheet_(name).getRange(idx + 2, 1, 1, row.length).setValues([row]);
+  else appendRow_(name, row);
+}
+
 function colMap_(name) {
   var m = {};
   SHEETS[name].forEach(function (k, i) { m[k] = i; });
   return m;
 }
 
-function readItems_() {
-  var sh = sheet_('Items');
+// -> {sheet, rows:[obj], index:{key: rowIndex}}  (key = first column)
+function read_(name) {
+  var sh = sheet_(name);
   var n = sh.getLastRow() - 1;
-  var items = [];
+  var rows = [];
   var index = {};
   if (n > 0) {
-    var vals = sh.getRange(2, 1, n, SHEETS.Items.length).getValues();
-    vals.forEach(function (r, i) {
-      var o = rowObj_(SHEETS.Items, r);
-      items.push(o);
-      if (o.code) index[o.code] = i;
+    sh.getRange(2, 1, n, SHEETS[name].length).getValues().forEach(function (r, i) {
+      var o = rowObj_(SHEETS[name], r);
+      rows.push(o);
+      var key = o[SHEETS[name][0]];
+      if (key) index[key] = i;
     });
   }
-  return { sheet: sh, items: items, index: index };
+  return { sheet: sh, rows: rows, index: index };
 }
 
 function rowObj_(cols, r) {
   var o = {};
   cols.forEach(function (k, i) {
     var v = r[i];
-    o[k] = v instanceof Date ? v.toISOString() : (k === 'code' ? String(v) : v);
+    o[k] = v instanceof Date ? v.toISOString() : ((TEXT_COLS_ALL_[k]) ? String(v) : v);
   });
   return o;
 }
+var TEXT_COLS_ALL_ = { code: 1, type_code: 1, serial: 1, lot: 1, ref: 1, mfg_date: 1, exp_date: 1 };
 
 function serialize_(rec) {
   var o = {};
@@ -214,24 +348,13 @@ function log_(action, code, raw, detail, device) {
 }
 
 function getConfig_(key) {
-  var sh = sheet_('Config');
-  var n = sh.getLastRow() - 1;
-  if (n < 1) return null;
-  var vals = sh.getRange(2, 1, n, 2).getValues();
-  for (var i = 0; i < vals.length; i++) if (vals[i][0] === key) return String(vals[i][1]);
-  return null;
+  var d = read_('Config');
+  return d.index[key] !== undefined ? String(d.rows[d.index[key]].value) : null;
 }
 
 function setConfig_(key, value) {
-  var sh = sheet_('Config');
-  var n = sh.getLastRow() - 1;
-  if (n > 0) {
-    var keys = sh.getRange(2, 1, n, 1).getValues();
-    for (var i = 0; i < keys.length; i++) {
-      if (keys[i][0] === key) { sh.getRange(i + 2, 2).setValue(String(value)); return; }
-    }
-  }
-  appendRow_('Config', [key, String(value)]);
+  var d = read_('Config');
+  writeRow_('Config', d.index[key], { key: key, value: String(value) });
 }
 
 function withLock_(fn) {
@@ -241,7 +364,6 @@ function withLock_(fn) {
 }
 
 function clean_(s) { return String(s === undefined || s === null ? '' : s).trim(); }
-function str_(v, fallback) { return v === undefined || v === null ? (fallback === undefined ? '' : fallback) : String(v); }
 
 function json_(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);

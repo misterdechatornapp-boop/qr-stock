@@ -43,16 +43,20 @@
 
   <!-- ============ STOCK ============ -->
   <section class="view" id="view-stock" hidden>
+    <div class="seg" role="tablist">
+      <button type="button" data-mode="items" class="on" role="tab">รายเครื่อง / ล็อต</button>
+      <button type="button" data-mode="products" role="tab">ประเภทสินค้า</button>
+    </div>
     <div class="toolbar">
-      <input type="search" id="stockSearch" placeholder="ค้นหารหัส ชื่อ หรือ note">
+      <input type="search" id="stockSearch" placeholder="ค้นหา ชื่อ GTIN REF Serial Lot note">
       <button class="btn icon" id="btnRefresh" type="button" title="โหลดใหม่" aria-label="โหลดใหม่">⟳</button>
     </div>
     <div class="toolbar sub">
-      <span id="stockCount" class="muted"></span>
-      <span class="grow"></span>
+      <select id="catFilter" aria-label="หมวดหมู่" style="width:auto;flex:1;min-width:0"></select>
       <button class="btn small" id="btnAddManual" type="button">+ เพิ่มเอง</button>
-      <button class="btn small" id="btnExport" type="button">Export CSV</button>
+      <button class="btn small" id="btnExport" type="button">CSV</button>
     </div>
+    <p id="stockCount" class="muted small" style="margin:0"></p>
     <ul class="list" id="stockList"></ul>
   </section>
 
@@ -68,7 +72,7 @@
       <h2 class="grow">กฎการอ่านค่า</h2>
       <button class="btn small" id="btnAddRule" type="button">+ เพิ่มกฎ</button>
     </div>
-    <p class="muted small">ระบบจะลองกฎจากบนลงล่าง ใช้กฎแรกที่ตรงและได้ค่า · ถ้าไม่มีกฎไหนตรง จะใช้ค่าทั้งหมดเป็นรหัส</p>
+    <p class="muted small">กฎแต่ละข้อบอกว่าค่าที่อ่านได้คือ <b>ประเภทสินค้า</b>, <b>Serial</b> (นับรายเครื่อง) หรือ <b>Lot</b> (นับตามล็อต) · ระบบลองจากบนลงล่าง ใช้กฎแรกที่ได้ค่าของแต่ละอย่าง · ไม่มีกฎประเภทไหนตรง = ใช้ค่าทั้งหมดเป็นประเภท · ข้อมูล GS1 อื่น (REF, วันผลิต, วันหมดอายุ) เก็บให้อัตโนมัติ</p>
     <ul class="list" id="ruleList"></ul>
     <div class="row-end"><button class="btn primary" id="btnSaveRules" type="button" disabled>บันทึกกฎ (ใช้ร่วมทุกเครื่อง)</button></div>
   </section>
@@ -103,6 +107,9 @@
   <button data-go="settings" type="button"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>ตั้งค่า</button>
 </nav>
 
+<datalist id="dlCategory"></datalist>
+<datalist id="dlBrand"></datalist>
+<datalist id="dlLocation"></datalist>
 <dialog id="dlg"><form method="dialog" id="dlgForm"></form></dialog>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 

@@ -1,5 +1,5 @@
 // QR Stock service worker — network first, cache fallback (so the app opens offline)
-var CACHE = 'qrstock-v1.0.1';
+var CACHE = 'qrstock-v1.1.0';
 var SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'rules.js', 'icon.svg', 'manifest.webmanifest',
   'https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js'];
 

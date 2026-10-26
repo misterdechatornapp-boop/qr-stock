@@ -302,28 +302,59 @@
     return v;
   }
 
-  // -> {code, rule (or null), tried:[{name,matched,value}]}
+  // what each rule fills in: the product type (GTIN), the individual unit (serial) or the lot
+  var ROLES = ['type', 'serial', 'lot'];
+
+  // first enabled rule per role that matches and yields a value
+  // -> {type, serial, lot, used:{role: rule}, typeFromRule:boolean}
   function apply(rules, raw, format) {
-    var tried = [];
-    for (var i = 0; i < (rules || []).length; i++) {
-      var r = rules[i];
-      if (r.enabled === false) continue;
-      var ok = matches(r, raw, format);
-      var v = ok ? post(r, extract(r, raw)) : '';
-      tried.push({ name: r.name, matched: ok, value: v });
-      if (ok && v) return { code: v, rule: r, tried: tried };
-    }
-    return { code: String(raw || '').trim(), rule: null, tried: tried };
+    var out = { type: '', serial: '', lot: '', used: {} };
+    (rules || []).forEach(function (r) {
+      if (r.enabled === false) return;
+      var role = r.role || 'type';
+      if (out[role] || !matches(r, raw, format)) return;
+      var v = post(r, extract(r, raw));
+      if (v) { out[role] = v; out.used[role] = r; }
+    });
+    out.typeFromRule = !!out.type;
+    if (!out.type) out.type = String(raw || '').trim(); // no rule → the whole code is the type
+    return out;
+  }
+
+  // unique key of one stock row: per unit (serial), per lot, or per type
+  function itemKey(type, serial, lot) {
+    if (serial) return type + '|SN:' + serial;
+    if (lot) return type + '|LOT:' + lot;
+    return type;
+  }
+
+  // YYMMDD → YYYY-MM-DD (day 00 = whole month → YYYY-MM)
+  function gs1Date(v) {
+    if (!/^\d{6}$/.test(v || '')) return v || '';
+    var y = '20' + v.slice(0, 2), m = v.slice(2, 4), d = v.slice(4, 6);
+    return d === '00' ? y + '-' + m : y + '-' + m + '-' + d;
+  }
+
+  // extra GS1 facts kept on the stock row
+  function gs1Extras(raw) {
+    var g = parseGS1(raw);
+    if (!g) return null;
+    var map = {};
+    g.fields.forEach(function (f) { map[f.ai] = f.value; });
+    return { fields: map, ref: map['240'] || '', mfg_date: gs1Date(map['11']), exp_date: gs1Date(map['17'] || map['7003'] && map['7003'].slice(0, 6)) };
   }
 
   function defaultRules() {
     return [
-      { id: 'r_gs1', name: 'GS1 → ใช้ GTIN (01)', enabled: true, match: { type: 'gs1' }, extract: { type: 'gs1', ai: '01' }, post: {} },
-      { id: 'r_url_id', name: 'ลิงก์ที่มี ?id= → ใช้ค่า id', enabled: false, match: { type: 'url' }, extract: { type: 'urlParam', param: 'id' }, post: {} }
+      { id: 'r_gs1_type', name: 'GS1 (01) GTIN → ประเภทสินค้า', role: 'type', enabled: true, match: { type: 'gs1' }, extract: { type: 'gs1', ai: '01' }, post: {} },
+      { id: 'r_gs1_sn', name: 'GS1 (21) Serial → รายเครื่อง', role: 'serial', enabled: true, match: { type: 'gs1' }, extract: { type: 'gs1', ai: '21' }, post: {} },
+      { id: 'r_gs1_lot', name: 'GS1 (10) Lot → ล็อต', role: 'lot', enabled: true, match: { type: 'gs1' }, extract: { type: 'gs1', ai: '10' }, post: {} },
+      { id: 'r_url_id', name: 'ลิงก์ที่มี ?id= → ประเภทสินค้า', role: 'type', enabled: false, match: { type: 'url' }, extract: { type: 'urlParam', param: 'id' }, post: {} }
     ];
   }
 
-  var api = { parseGS1: parseGS1, inspect: inspect, apply: apply, matches: matches, extract: extract, post: post, gtinValid: gtinValid, defaultRules: defaultRules };
+  var api = { parseGS1: parseGS1, inspect: inspect, apply: apply, matches: matches, extract: extract, post: post, gtinValid: gtinValid,
+    defaultRules: defaultRules, itemKey: itemKey, gs1Extras: gs1Extras, gs1Date: gs1Date, ROLES: ROLES };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.QRRules = api;
 })(this);

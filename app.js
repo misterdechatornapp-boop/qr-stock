@@ -1,7 +1,7 @@
 /* QR Stock — UI */
 (function () {
   'use strict';
-  var APP_VERSION = '1.0.1';
+  var APP_VERSION = '1.1.0';
   var SETUP_PREFIX = 'QRSTOCK-SETUP:';
   var R = window.QRRules;
 
@@ -18,6 +18,21 @@
     if (withTime !== false) s += ' ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
     return s;
   }
+  // 'YYYY-MM-DD' or 'YYYY-MM' (GS1 dates) → Thai date
+  function fmtDay(v) {
+    var m = String(v || '').match(/^(\d{4})-(\d{2})(?:-(\d{2}))?$/);
+    if (!m) return v ? String(v) : '-';
+    return (m[3] ? Number(m[3]) + ' ' : '') + TH_MONTHS[Number(m[2]) - 1] + ' ' + (Number(m[1]) + 543);
+  }
+  function expBadge(v) {
+    var m = String(v || '').match(/^(\d{4})-(\d{2})(?:-(\d{2}))?$/);
+    if (!m) return '';
+    var end = m[3] ? new Date(+m[1], +m[2] - 1, +m[3]) : new Date(+m[1], +m[2], 0);
+    var days = Math.floor((end - new Date().setHours(0, 0, 0, 0)) / 864e5);
+    if (days < 0) return '<span class="badge bad">หมดอายุแล้ว</span>';
+    if (days <= 90) return '<span class="badge warn">ใกล้หมดอายุ · ' + days + ' วัน</span>';
+    return '';
+  }
   var toastTimer;
   function toast(msg, bad) {
     var t = $('#toast');
@@ -30,29 +45,53 @@
     if (btn) { btn.classList.add('loading'); btn.disabled = true; }
     try { return await fn(); } finally { if (btn) { btn.classList.remove('loading'); btn.disabled = false; } }
   }
+  function kindOf(x) { return x.serial ? 'serial' : x.lot ? 'lot' : 'type'; }
+  function isImg(s) { return /^data:image\/(jpeg|png|webp);base64,/.test(s || ''); }
 
   /* ---------- state ---------- */
   var cfg = store('cfg') || { url: '', key: '', device: '' };
   var opts = store('opts') || { beep: true, autoCam: false };
-  var items = store('items') || [];
-  var rules = store('rules') || R.defaultRules();
+  var items = store('items2') || [];
+  var products = store('products') || [];
+  var rules = store('rules2') || R.defaultRules();
   var rulesDirty = false;
   var lastRaw = null;
-  var current = null; // {raw, format, code, rule, info, item, status}
+  var current = null; // scan context, see parseCode()
+  var stockMode = 'items';
+  var byCode = {}, byType = {};
 
-  function indexItems() { var m = {}; items.forEach(function (it) { m[it.code] = it; }); return m; }
-  var byCode = indexItems();
-  function setItems(list) { items = list; byCode = indexItems(); store('items', items); renderStock(); }
+  function reindex() {
+    byCode = {}; byType = {};
+    items.forEach(function (it) { byCode[it.code] = it; });
+    products.forEach(function (p) { byType[p.type_code] = p; });
+  }
+  function saveLocal() { reindex(); store('items2', items); store('products', products); renderStock(); fillDatalists(); }
   function putItem(it) {
+    if (!it) return;
     var i = items.findIndex(function (x) { return x.code === it.code; });
     if (i >= 0) items[i] = it; else items.push(it);
-    setItems(items);
+    saveLocal();
+  }
+  function putProduct(p) {
+    if (!p) return;
+    var i = products.findIndex(function (x) { return x.type_code === p.type_code; });
+    if (i >= 0) products[i] = p; else products.push(p);
+    saveLocal();
+  }
+  function unitsOf(type) { return items.filter(function (it) { return it.type_code === type; }); }
+  function totalOf(type) {
+    var u = unitsOf(type);
+    var n = u.reduce(function (s, it) { return s + (it.serial ? 1 : Number(it.qty) || 0); }, 0);
+    var unit = u.every(function (it) { return it.serial; }) ? 'เครื่อง' : (u.filter(function (it) { return it.unit; })[0] || {}).unit || '';
+    return n + (unit ? ' ' + unit : '');
   }
 
   /* ---------- server ---------- */
   var ERR_TH = {
-    unauthorized: 'รหัสเข้าใช้ไม่ถูกต้อง', duplicate_code: 'รหัสนี้มีอยู่ในคลังแล้ว', not_found: 'ไม่พบรายการนี้',
-    empty_code: 'ยังไม่มีรหัสสินค้า', no_config: 'ยังไม่ได้ตั้งค่าการเชื่อมต่อ (ไปที่ ตั้งค่า)', network: 'เชื่อมต่อเซิร์ฟเวอร์ไม่ได้'
+    unauthorized: 'รหัสเข้าใช้ไม่ถูกต้อง', duplicate_code: 'รายการนี้มีอยู่ในคลังแล้ว', not_found: 'ไม่พบรายการนี้',
+    empty_code: 'ยังไม่มีรหัส', no_config: 'ยังไม่ได้ตั้งค่าการเชื่อมต่อ (ไปที่ ตั้งค่า)', network: 'เชื่อมต่อเซิร์ฟเวอร์ไม่ได้',
+    has_items: 'ยังมีเครื่อง/ล็อตของประเภทนี้อยู่ในคลัง ลบรายการเหล่านั้นก่อน', bad_image: 'รูปใหญ่เกินไป',
+    unknown_action: 'เซิร์ฟเวอร์ยังเป็นเวอร์ชันเก่า'
   };
   function errText(e) { var m = (e && e.message) || String(e); return ERR_TH[m] || m; }
 
@@ -82,9 +121,11 @@
     if (!cfg.url) { setConn(null); return; }
     try {
       var r = await Promise.all([api('list'), api('getRules')]);
-      setItems(r[0].items || []);
-      var srvRules = JSON.parse(r[1].rules || '[]');
-      if (srvRules.length && !rulesDirty) { rules = srvRules; store('rules', rules); renderRules(); }
+      items = r[0].items || [];
+      products = r[0].products || [];
+      saveLocal();
+      var srvRules = r[1].rules ? JSON.parse(r[1].rules) : null;
+      if (srvRules && srvRules.length && !rulesDirty) { rules = srvRules; store('rules2', rules); renderRules(); }
       if (!silent) toast('โหลดข้อมูลล่าสุดแล้ว');
     } catch (e) { if (!silent) toast(errText(e), true); }
   }
@@ -181,83 +222,144 @@
   }
 
   /* ---------- scan handling ---------- */
+  function parseCode(raw, format) {
+    var a = R.apply(rules, raw, format);
+    var ex = R.gs1Extras(raw) || {};
+    return {
+      raw: raw, format: format, type: a.type, serial: a.serial, lot: a.lot, used: a.used,
+      ref: ex.ref || '', mfg_date: ex.mfg_date || '', exp_date: ex.exp_date || '', fields: ex.fields || null,
+      info: R.inspect(raw, format)
+    };
+  }
+
   function handleRaw(raw, format) {
     raw = String(raw || '');
     if (raw.indexOf(SETUP_PREFIX) === 0) return applySetup(raw.slice(SETUP_PREFIX.length));
     beep();
     lastRaw = { raw: raw, format: format };
-    var a = R.apply(rules, raw, format);
-    current = { raw: raw, format: format, code: a.code, rule: a.rule, info: R.inspect(raw, format), item: byCode[a.code] || null, status: 'wait' };
-    renderResult();
-    lookup(true);
+    current = parseCode(raw, format);
+    resolveCurrent(true);
   }
+
+  function resolveCurrent(log) {
+    var c = current;
+    c.code = R.itemKey(c.type, c.serial, c.lot);
+    c.item = byCode[c.code] || null;
+    c.product = byType[c.type] || null;
+    c.status = c.item ? 'ok' : 'wait';
+    renderResult();
+    lookup(log);
+  }
+
+  function statusOf(c) { return c.item ? 'ok' : c.product ? 'known' : 'new'; }
 
   async function lookup(log) {
     var c = current;
     if (!c) return;
-    c.item = byCode[c.code] || null;
-    if (!cfg.url) { c.status = c.item ? 'ok' : 'new'; c.offline = true; renderResult(); return; }
-    c.status = c.item ? 'ok' : 'wait';
-    renderResult();
+    if (!cfg.url) { c.status = statusOf(c); c.offline = true; renderResult(); return; }
     try {
-      var r = await api('scan', { code: c.code, raw: c.raw, log: log !== false });
+      var r = await api('scan', { code: c.code, type_code: c.type, raw: c.raw, log: log !== false });
       if (c !== current) return;
       c.item = r.item || null;
-      c.status = c.item ? 'ok' : 'new';
+      c.product = r.product || null;
       c.offline = false;
       if (c.item) putItem(c.item);
-      else if (byCode[c.code]) setItems(items.filter(function (x) { return x.code !== c.code; }));
+      else if (byCode[c.code]) { items = items.filter(function (x) { return x.code !== c.code; }); saveLocal(); }
+      if (c.product) putProduct(c.product);
     } catch (e) {
       if (c !== current) return;
-      c.status = c.item ? 'ok' : 'new'; c.offline = true;
+      c.offline = true;
       toast(errText(e) + ' — แสดงจากข้อมูลในเครื่อง', true);
     }
+    c.status = statusOf(c);
     renderResult();
   }
 
-  function infoBlock(info, raw, format) {
-    var rows = info.details.map(function (d) { return '<dt>' + esc(d[0]) + '</dt><dd>' + esc(d[1]) + '</dd>'; }).join('');
-    return '<details' + (current && current.status === 'new' ? ' open' : '') + '><summary>QR นี้คืออะไร · <b>' + esc(info.label) + '</b>' + (format && format !== 'MANUAL' ? ' · ' + esc(format) : '') + '</summary>' +
-      '<div class="raw" style="margin-top:8px">' + esc(raw.replace(/\u001d/g, '‹GS›')) + '</div>' +
+  function thumb(p, lg) {
+    return p && isImg(p.thumb) ? '<img class="thumb' + (lg ? ' lg' : '') + '" src="' + esc(p.thumb) + '" alt="">' : '<div class="thumb' + (lg ? ' lg' : '') + '">📦</div>';
+  }
+
+  function productHead(p, type) {
+    var sub = p ? [p.ref, p.category, p.brand].filter(Boolean).join(' · ') : '';
+    return '<div class="product-head">' + thumb(p, true) + '<div style="min-width:0"><div class="t">' +
+      (p && p.name ? esc(p.name) : '<span class="muted">ประเภทใหม่ (ยังไม่ตั้งชื่อ)</span>') + '</div>' +
+      '<div class="small muted">' + esc(sub || type) + '</div></div></div>';
+  }
+
+  function idRows(c) {
+    var it = c.item || {}, p = c.product || {};
+    var used = c.used || {};
+    var chip = function (role) { return used[role] ? ' <span class="chip">' + esc(used[role].name) + '</span>' : ''; };
+    var ref = c.ref || it.ref || p.ref;
+    var exp = c.exp_date || it.exp_date;
+    var mfg = c.mfg_date || it.mfg_date;
+    return '<dl class="kv">' +
+      '<dt>ประเภท (GTIN)</dt><dd>' + esc(c.type) + (c.used && !used.type ? ' <span class="muted small">(ใช้ค่าทั้งหมด)</span>' : chip('type')) + '</dd>' +
+      (ref ? '<dt>REF</dt><dd>' + esc(ref) + '</dd>' : '') +
+      (c.serial ? '<dt>Serial</dt><dd><b>' + esc(c.serial) + '</b>' + chip('serial') + '</dd>' : '') +
+      (c.lot ? '<dt>Lot</dt><dd><b>' + esc(c.lot) + '</b>' + chip('lot') + '</dd>' : '') +
+      (mfg ? '<dt>วันผลิต</dt><dd>' + fmtDay(mfg) + '</dd>' : '') +
+      (exp ? '<dt>วันหมดอายุ</dt><dd>' + fmtDay(exp) + ' ' + expBadge(exp) + '</dd>' : '') +
+      '</dl>';
+  }
+
+  function infoBlock(c) {
+    var rows = c.info.details.map(function (d) { return '<dt>' + esc(d[0]) + '</dt><dd>' + esc(d[1]) + '</dd>'; }).join('');
+    if (!c.raw) return '';
+    return '<details><summary>ข้อมูลทั้งหมดในโค้ด · <b>' + esc(c.info.label) + '</b>' + (c.format && c.format !== 'MANUAL' ? ' · ' + esc(c.format) : '') + '</summary>' +
+      '<div class="raw" style="margin-top:8px">' + esc(c.raw.replace(/\u001d/g, '‹GS›')) + '</div>' +
       (rows ? '<dl class="kv" style="margin-top:8px">' + rows + '</dl>' : '') + '</details>';
   }
+
+  var KIND_TH = { serial: 'เครื่องนี้', lot: 'ล็อตนี้', type: 'รายการนี้' };
 
   function renderResult() {
     var el = $('#result');
     var c = current;
     if (!c) { el.innerHTML = ''; return; }
-    var pill = c.status === 'ok' ? '<span class="status-pill ok">✓ มีในคลังแล้ว</span>'
-      : c.status === 'new' ? '<span class="status-pill new">ยังไม่เคยลงทะเบียน</span>'
-      : '<span class="status-pill wait">กำลังตรวจสอบ…</span>';
-    var ruleTxt = c.rule ? 'ใช้กฎ: <span class="chip">' + esc(c.rule.name) + '</span>' : '<span class="muted">ไม่มีกฎที่ตรง → ใช้ค่าทั้งหมด</span>';
-    var h = '<div class="card result ' + c.status + '">' + pill +
-      '<div><div class="muted small">รหัสสินค้า</div><div class="code-big">' + esc(c.code || '—') + '</div><div class="small">' + ruleTxt + '</div></div>';
+    var kind = kindOf(c);
+    var pill = {
+      ok: '<span class="status-pill ok">✓ มีในคลังแล้ว</span>',
+      known: '<span class="status-pill new">' + (kind === 'serial' ? 'เครื่องใหม่' : kind === 'lot' ? 'ล็อตใหม่' : 'ยังไม่อยู่ในคลัง') + ' · รู้จักรุ่นนี้แล้ว</span>',
+      new: '<span class="status-pill new">ยังไม่เคยลงทะเบียน</span>',
+      wait: '<span class="status-pill wait">กำลังตรวจสอบ…</span>'
+    }[c.status];
+    var h = '<div class="card result ' + (c.status === 'ok' ? 'ok' : c.status === 'wait' ? '' : 'new') + '">' + pill +
+      productHead(c.product, c.type) + idRows(c);
 
     if (c.status === 'ok' && c.item) {
       var it = c.item;
-      h += '<dl class="kv">' +
-        '<dt>ชื่อ</dt><dd><b>' + esc(it.name || '-') + '</b></dd>' +
-        (it.qty !== '' && it.qty != null ? '<dt>จำนวน</dt><dd>' + esc(it.qty) + ' ' + esc(it.unit || '') + '</dd>' : '') +
+      h += '<div class="section-label">' + KIND_TH[kind] + '</div><dl class="kv">' +
+        (kind !== 'serial' ? '<dt>จำนวน</dt><dd><div class="qty-row"><button class="btn" type="button" data-act="minus" aria-label="ลด">−</button><b>' + esc(it.qty === '' ? 0 : it.qty) + '</b><button class="btn" type="button" data-act="plus" aria-label="เพิ่ม">+</button><span>' + esc(it.unit || '') + '</span></div></dd>' : '') +
         (it.location ? '<dt>ที่เก็บ</dt><dd>' + esc(it.location) + '</dd>' : '') +
         '<dt>ลงทะเบียนเมื่อ</dt><dd>' + fmtDate(it.created_at) + '</dd>' +
         '<dt>สแกนแล้ว</dt><dd>' + esc(it.scan_count || 0) + ' ครั้ง</dd></dl>' +
         (it.note ? '<div><div class="muted small">Note</div><div class="note-box">' + esc(it.note) + '</div></div>' : '') +
         '<div class="row-end"><button class="btn" type="button" data-act="history">ประวัติ</button>' +
-        '<button class="btn primary" type="button" data-act="edit">แก้ไข / เพิ่ม note</button></div>';
-    } else if (c.status === 'new') {
-      h += '<form id="regForm" class="card" style="padding:0;border:0;box-shadow:none">' +
-        '<label>รหัสสินค้า (แก้ได้)<input name="code" value="' + esc(c.code) + '" required></label>' +
-        '<label>ชื่อสินค้า<input name="name" placeholder="เช่น ถุงมือยาง ไซซ์ M"></label>' +
-        '<label>Note<textarea name="note" rows="2" placeholder="รายละเอียด / ข้อสังเกต"></textarea></label>' +
-        '<div class="grid2"><label>จำนวน<input name="qty" type="number" inputmode="decimal" step="any"></label>' +
-        '<label>หน่วย<input name="unit" placeholder="ชิ้น / กล่อง"></label></div>' +
-        '<label>ที่เก็บ<input name="location" placeholder="เช่น ชั้น A2"></label>' +
+        '<button class="btn" type="button" data-act="product">ข้อมูลประเภท</button>' +
+        '<button class="btn primary" type="button" data-act="edit">แก้ไข / note</button></div>';
+    } else if (c.status === 'known' || c.status === 'new') {
+      h += '<form id="regForm" class="card" style="padding:0;border:0;box-shadow:none">';
+      if (c.status === 'new') {
+        h += '<div class="section-label">ประเภทสินค้า (ตั้งครั้งเดียว ใช้กับทุกชิ้นของรุ่นนี้)</div>' +
+          '<label>ชื่อสินค้า *<input name="p_name" required placeholder="เช่น Colibrì Auxiliary Battery Kit"></label>' +
+          '<div class="grid2"><label>หมวดหมู่<input name="p_category" list="dlCategory" placeholder="เช่น แบตเตอรี่"></label>' +
+          '<label>ยี่ห้อ / ผู้ผลิต<input name="p_brand" list="dlBrand"></label></div>' +
+          '<label>REF<input name="p_ref" value="' + esc(c.ref) + '"></label>' +
+          '<label>Note ของรุ่นนี้<textarea name="p_note" rows="2"></textarea></label>' +
+          '<label>รูปสินค้า<input name="p_photo" type="file" accept="image/*"></label>';
+      }
+      h += '<div class="section-label">' + KIND_TH[kind] + '</div>' +
+        (kind !== 'serial' ? '<div class="grid2"><label>จำนวน<input name="qty" type="number" inputmode="decimal" step="any" value="1"></label>' +
+          '<label>หน่วย<input name="unit" placeholder="ชิ้น / กล่อง"></label></div>' : '') +
+        '<label>ที่เก็บ<input name="location" list="dlLocation" placeholder="เช่น ห้อง OR 2 / ชั้น A2"></label>' +
+        '<label>Note ของ' + KIND_TH[kind].replace('นี้', '') + 'นี้<textarea name="note" rows="2" placeholder="สภาพ / ข้อสังเกต"></textarea></label>' +
         '<div class="row-end"><button class="btn primary" type="submit">บันทึกเข้าคลัง</button></div></form>';
     }
-    h += infoBlock(c.info, c.raw, c.format);
+    h += infoBlock(c);
     h += '<div class="row-end">' +
-      '<button class="btn small" type="button" data-act="rule">ตั้งกฎจากโค้ดนี้</button>' +
-      (c.status !== 'new' ? '<button class="btn small" type="button" data-act="recode">แก้รหัสแล้วตรวจใหม่</button>' : '') +
+      (c.raw ? '<button class="btn small" type="button" data-act="rule">ตั้งกฎจากโค้ดนี้</button>' : '') +
+      '<button class="btn small" type="button" data-act="recode">แก้รหัส</button>' +
       (camOn ? '<button class="btn small primary" type="button" data-act="next">สแกนถัดไป</button>' : '') + '</div>';
     if (c.offline && cfg.url) h += '<p class="small muted">แสดงจากข้อมูลในเครื่อง (ออฟไลน์)</p>';
     if (!cfg.url) h += '<p class="small muted">ยังไม่ได้เชื่อม Google Sheet — ไปที่ <a href="#" data-go="settings">ตั้งค่า</a></p>';
@@ -265,20 +367,41 @@
     el.innerHTML = h;
 
     var form = $('#regForm');
-    if (form) form.addEventListener('submit', function (e) {
-      e.preventDefault();
-      var fd = new FormData(form);
-      var it = { code: fd.get('code').trim(), name: fd.get('name'), note: fd.get('note'), qty: fd.get('qty'), unit: fd.get('unit'), location: fd.get('location'), format: c.format, raw_sample: c.raw };
-      busy(form.querySelector('button[type=submit]'), async function () {
-        try {
-          var r = await api('save', { item: it, mode: 'create' });
-          putItem(r.item);
-          c.code = r.item.code; c.item = r.item; c.status = 'ok';
-          toast('บันทึกเข้าคลังแล้ว');
-          renderResult();
-        } catch (err) { toast(errText(err), true); }
-      });
+    if (form) form.addEventListener('submit', function (e) { e.preventDefault(); register(form, c); });
+  }
+
+  async function register(form, c) {
+    var fd = new FormData(form);
+    var kind = kindOf(c);
+    var item = {
+      code: c.code, type_code: c.type, serial: c.serial, lot: c.lot, ref: c.ref || (c.product && c.product.ref) || fd.get('p_ref') || '',
+      mfg_date: c.mfg_date, exp_date: c.exp_date, fields: c.fields ? JSON.stringify(c.fields) : '', format: c.format, raw_sample: c.raw,
+      qty: kind === 'serial' ? 1 : fd.get('qty'), unit: kind === 'serial' ? '' : fd.get('unit'), location: fd.get('location'), note: fd.get('note')
+    };
+    var product = c.product ? null : { type_code: c.type, name: fd.get('p_name'), category: fd.get('p_category'), brand: fd.get('p_brand'), ref: fd.get('p_ref'), note: fd.get('p_note') };
+    var photo = form.p_photo && form.p_photo.files[0];
+    await busy(form.querySelector('button[type=submit]'), async function () {
+      try {
+        var r = await api('saveItem', { item: item, product: product, mode: 'create' });
+        putItem(r.item); putProduct(r.product);
+        c.item = r.item; c.product = r.product; c.status = 'ok';
+        toast('บันทึกเข้าคลังแล้ว');
+        renderResult();
+        if (photo) await uploadPhoto(c.type, photo);
+      } catch (err) { toast(errText(err), true); }
     });
+  }
+
+  async function changeQty(delta) {
+    var c = current, it = c && c.item;
+    if (!it) return;
+    var q = Math.max(0, (Number(it.qty) || 0) + delta);
+    try {
+      var r = await api('saveItem', { item: { code: it.code, type_code: it.type_code, qty: q }, mode: 'update' });
+      putItem(r.item);
+      if (current === c) { c.item = r.item; renderResult(); }
+      toast('จำนวน: ' + q);
+    } catch (e) { toast(errText(e), true); }
   }
 
   $('#result').addEventListener('click', function (e) {
@@ -287,21 +410,75 @@
     var act = b.dataset.act;
     if (act === 'next') { current = null; renderResult(); resumeCam(); }
     else if (act === 'edit') openItem(current.item);
+    else if (act === 'product') openProduct(current.product || { type_code: current.type });
     else if (act === 'history') openHistory(current.code);
+    else if (act === 'plus' || act === 'minus') busy(b, function () { return changeQty(act === 'plus' ? 1 : -1); });
     else if (act === 'rule') { $('#ruleSample').value = current.raw; go('rules'); }
-    else if (act === 'recode') {
-      dialog('<h3>แก้รหัสแล้วตรวจใหม่</h3><label>รหัสสินค้า<input name="code" value="' + esc(current.code) + '"></label>',
-        [['ยกเลิก'], ['ตรวจ', 'primary', 'ok']]).then(function (r) {
-        if (r && r.btn === 'ok' && r.data.code.trim()) { current.code = r.data.code.trim(); current.rule = null; lookup(false); }
-      });
-    }
+    else if (act === 'recode') recode();
   });
+
+  async function recode(fresh) {
+    var c = fresh ? { type: '', serial: '', lot: '' } : current;
+    var r = await dialog('<h3>' + (fresh ? 'เพิ่มรายการเอง' : 'แก้รหัส') + '</h3>' +
+      '<label>รหัสประเภท (GTIN หรือรหัสสินค้า) *<input name="type" required value="' + esc(c.type) + '"></label>' +
+      '<label>Serial (ถ้ามี = นับรายเครื่อง)<input name="serial" value="' + esc(c.serial) + '"></label>' +
+      '<label>Lot (ถ้ามี = นับตามล็อต)<input name="lot" value="' + esc(c.lot) + '"></label>',
+      [['ยกเลิก'], ['ตรวจ', 'primary', 'ok']]);
+    if (r.btn !== 'ok' || !r.data.type.trim()) return;
+    if (fresh) {
+      current = { raw: '', format: 'MANUAL', used: null, ref: '', mfg_date: '', exp_date: '', fields: null, info: { label: 'กรอกเอง', details: [] } };
+      go('scan');
+    }
+    current.type = r.data.type.trim(); current.serial = r.data.serial.trim(); current.lot = r.data.lot.trim();
+    current.used = null;
+    resolveCurrent(false);
+  }
+
+  /* ---------- photos ---------- */
+  function loadImage(file) {
+    return new Promise(function (resolve, reject) {
+      var img = new Image();
+      img.onload = function () { resolve(img); };
+      img.onerror = reject;
+      img.src = URL.createObjectURL(file);
+    });
+  }
+  function toJpeg(img, max, q) {
+    var s = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+    var cv = document.createElement('canvas');
+    cv.width = Math.round(img.naturalWidth * s); cv.height = Math.round(img.naturalHeight * s);
+    cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+    return cv.toDataURL('image/jpeg', q);
+  }
+  async function uploadPhoto(type, file) {
+    toast('กำลังอัปโหลดรูป…');
+    try {
+      var img = await loadImage(file);
+      // stored in the Sheet as text — keep it under the server's ~600k-char limit
+      var full = toJpeg(img, 1024, 0.75);
+      if (full.length > 560000) full = toJpeg(img, 800, 0.65);
+      var th = toJpeg(img, 160, 0.7);
+      var r = await api('uploadImage', { type_code: type, data: full.split(',')[1], thumb: th, mime: 'image/jpeg' });
+      var p = Object.assign({}, byType[type], { image_id: r.image_id, thumb: th });
+      imgCache[r.image_id] = full;
+      putProduct(p);
+      if (current && current.type === type) { current.product = p; renderResult(); }
+      toast('อัปโหลดรูปแล้ว');
+    } catch (e) { toast('อัปโหลดรูปไม่สำเร็จ: ' + errText(e), true); }
+  }
+  var imgCache = {};
+  async function fullImage(id) {
+    if (!id) return '';
+    if (imgCache[id]) return imgCache[id];
+    var r = await api('image', { id: id });
+    return (imgCache[id] = 'data:' + r.mime + ';base64,' + r.data);
+  }
 
   /* ---------- generic dialog (no native prompt/confirm) ---------- */
   function dialog(html, buttons) {
     var dlg = $('#dlg'), form = $('#dlgForm');
     form.innerHTML = html + '<div class="row-end">' + buttons.map(function (b) {
-      return '<button class="btn ' + (b[1] || '') + '" value="' + (b[2] || 'cancel') + '"' + (b[2] ? '' : ' formnovalidate') + '>' + esc(b[0]) + '</button>';
+      return '<button class="btn ' + (b[1] || '') + '" value="' + (b[2] || 'cancel') + '"' + (b[2] && b[2] !== 'del' ? '' : ' formnovalidate') + '>' + esc(b[0]) + '</button>';
     }).join('') + '</div>';
     return new Promise(function (resolve) {
       // resolve on submit (immediate) rather than on the dialog's close event, which can lag
@@ -309,7 +486,7 @@
         form.removeEventListener('submit', onSubmit);
         dlg.removeEventListener('close', onClose);
         var data = {};
-        form.querySelectorAll('[name]').forEach(function (i) { data[i.name] = i.type === 'checkbox' ? i.checked : i.value; });
+        form.querySelectorAll('[name]').forEach(function (i) { data[i.name] = i.type === 'checkbox' ? i.checked : i.type === 'file' ? i.files[0] : i.value; });
         if (dlg.open) dlg.close(btn);
         resolve({ btn: btn, data: data });
       }
@@ -327,45 +504,100 @@
       .then(function (r) { return r.btn === 'ok'; });
   }
 
-  /* ---------- item edit / history ---------- */
-  function itemFields(it) {
-    it = it || {};
-    return '<label>รหัสสินค้า<input name="code" value="' + esc(it.code) + '" required></label>' +
-      '<label>ชื่อสินค้า<input name="name" value="' + esc(it.name) + '"></label>' +
-      '<label>Note<textarea name="note" rows="4">' + esc(it.note) + '</textarea></label>' +
-      '<div class="grid2"><label>จำนวน<input name="qty" type="number" step="any" inputmode="decimal" value="' + esc(it.qty) + '"></label>' +
-      '<label>หน่วย<input name="unit" value="' + esc(it.unit) + '"></label></div>' +
-      '<label>ที่เก็บ<input name="location" value="' + esc(it.location) + '"></label>';
-  }
-
+  /* ---------- unit (item) dialog ---------- */
   async function openItem(it) {
-    var isNew = !it;
-    var meta = it ? '<p class="small muted" style="margin:0">ลงทะเบียน ' + fmtDate(it.created_at) + ' · แก้ไขล่าสุด ' + fmtDate(it.updated_at) + ' · สแกน ' + (it.scan_count || 0) + ' ครั้ง</p>' : '';
-    var btns = isNew ? [['ยกเลิก'], ['บันทึก', 'primary', 'save']] : [['ลบ', 'danger', 'del'], ['ยกเลิก'], ['บันทึก', 'primary', 'save']];
-    var r = await dialog('<h3>' + (isNew ? 'เพิ่มรายการเอง' : 'แก้ไขรายการ') + '</h3>' + meta + itemFields(it), btns);
+    if (!it) return;
+    var p = byType[it.type_code];
+    var kind = kindOf(it);
+    var html = '<h3>' + (kind === 'serial' ? 'เครื่อง SN ' + esc(it.serial) : kind === 'lot' ? 'ล็อต ' + esc(it.lot) : 'รายการ') + '</h3>' +
+      productHead(p, it.type_code) +
+      '<dl class="kv"><dt>ประเภท (GTIN)</dt><dd>' + esc(it.type_code) + '</dd>' +
+      (it.ref ? '<dt>REF</dt><dd>' + esc(it.ref) + '</dd>' : '') +
+      (it.mfg_date ? '<dt>วันผลิต</dt><dd>' + fmtDay(it.mfg_date) + '</dd>' : '') +
+      (it.exp_date ? '<dt>วันหมดอายุ</dt><dd>' + fmtDay(it.exp_date) + ' ' + expBadge(it.exp_date) + '</dd>' : '') +
+      '<dt>ลงทะเบียน</dt><dd>' + fmtDate(it.created_at) + '</dd><dt>สแกน</dt><dd>' + esc(it.scan_count || 0) + ' ครั้ง</dd></dl>' +
+      (kind !== 'serial' ? '<div class="grid2"><label>จำนวน<input name="qty" type="number" step="any" inputmode="decimal" value="' + esc(it.qty) + '"></label>' +
+        '<label>หน่วย<input name="unit" value="' + esc(it.unit) + '"></label></div>' : '') +
+      '<label>ที่เก็บ<input name="location" list="dlLocation" value="' + esc(it.location) + '"></label>' +
+      '<label>Note<textarea name="note" rows="4">' + esc(it.note) + '</textarea></label>';
+    var r = await dialog(html, [['ลบ', 'danger', 'del'], ['ประวัติ', '', 'hist'], ['ยกเลิก'], ['บันทึก', 'primary', 'save']]);
+    if (r.btn === 'hist') return openHistory(it.code);
     if (r.btn === 'del') {
-      if (await confirmBox('ลบ "' + (it.name || it.code) + '" ออกจากคลัง? (ประวัติยังอยู่ใน Sheet)', 'ลบ')) {
-        try { await api('remove', { code: it.code }); setItems(items.filter(function (x) { return x.code !== it.code; })); toast('ลบแล้ว'); if (current && current.code === it.code) { current.item = null; current.status = 'new'; renderResult(); } }
-        catch (e) { toast(errText(e), true); }
+      if (await confirmBox('ลบ ' + (it.serial ? 'SN ' + it.serial : it.lot ? 'ล็อต ' + it.lot : it.code) + ' ออกจากคลัง? (ประวัติยังอยู่ใน Sheet)', 'ลบ')) {
+        try {
+          await api('removeItem', { code: it.code });
+          items = items.filter(function (x) { return x.code !== it.code; }); saveLocal();
+          toast('ลบแล้ว');
+          if (current && current.code === it.code) { current.item = null; current.status = statusOf(current); renderResult(); }
+        } catch (e) { toast(errText(e), true); }
       }
       return;
     }
     if (r.btn !== 'save') return;
     var d = r.data;
-    if (!d.code.trim()) return toast('ต้องมีรหัสสินค้า', true);
+    var upd = { code: it.code, type_code: it.type_code, location: d.location, note: d.note };
+    if (kind !== 'serial') { upd.qty = d.qty; upd.unit = d.unit; }
     toast('กำลังบันทึก…');
     try {
-      var res = await api('save', { item: d, originalCode: isNew ? '' : it.code, mode: isNew ? 'create' : 'update' });
-      if (!isNew && it.code !== res.item.code) items = items.filter(function (x) { return x.code !== it.code; });
+      var res = await api('saveItem', { item: upd, mode: 'update' });
       putItem(res.item);
-      if (current && (current.code === (it && it.code) || current.code === res.item.code)) { current.code = res.item.code; current.item = res.item; current.status = 'ok'; renderResult(); }
+      if (current && current.code === it.code) { current.item = res.item; renderResult(); }
       toast('บันทึกแล้ว');
     } catch (e) { toast(errText(e), true); }
   }
 
-  var ACT_TH = { scan: 'สแกน', create: 'ลงทะเบียน', update: 'แก้ไข', delete: 'ลบ', rules: 'กฎ' };
+  /* ---------- product (type) dialog ---------- */
+  async function openProduct(p) {
+    var isNew = !byType[p.type_code];
+    var units = unitsOf(p.type_code);
+    var html = '<h3>' + (isNew ? 'ตั้งข้อมูลประเภทสินค้า' : 'ประเภทสินค้า') + '</h3>' +
+      '<img id="dlgPhoto" class="photo-full" alt="" ' + (isImg(p.thumb) ? 'src="' + esc(p.thumb) + '"' : 'hidden') + '>' +
+      '<label>รูปสินค้า (เลือกใหม่เพื่อเปลี่ยน)<input name="photo" type="file" accept="image/*"></label>' +
+      '<label>รหัสประเภท (GTIN)<input value="' + esc(p.type_code) + '" disabled></label>' +
+      '<label>ชื่อสินค้า *<input name="name" required value="' + esc(p.name) + '"></label>' +
+      '<div class="grid2"><label>หมวดหมู่<input name="category" list="dlCategory" value="' + esc(p.category) + '"></label>' +
+      '<label>ยี่ห้อ / ผู้ผลิต<input name="brand" list="dlBrand" value="' + esc(p.brand) + '"></label></div>' +
+      '<label>REF<input name="ref" value="' + esc(p.ref) + '"></label>' +
+      '<label>Note ของรุ่นนี้<textarea name="note" rows="3">' + esc(p.note) + '</textarea></label>' +
+      (units.length ? '<div class="section-label">ในคลัง ' + units.length + ' รายการ · รวม ' + totalOf(p.type_code) + '</div><ul class="sub-list">' + units.map(function (u) {
+        return '<li><button class="btn small" style="width:100%;justify-content:space-between" value="unit:' + esc(u.code) + '" formnovalidate><span>' +
+          esc(u.serial ? 'SN ' + u.serial : u.lot ? 'LOT ' + u.lot : u.code) + '</span><span class="muted">' + esc(u.serial ? (u.location || '') : (u.qty + ' ' + (u.unit || ''))) + '</span></button></li>';
+      }).join('') + '</ul>' : '');
+    var pr = dialog(html, isNew ? [['ยกเลิก'], ['บันทึก', 'primary', 'save']] : [['ลบ', 'danger', 'del'], ['ยกเลิก'], ['บันทึก', 'primary', 'save']]);
+    var photoEl = $('#dlgPhoto');
+    if (p.image_id) fullImage(p.image_id).then(function (src) { if (photoEl.isConnected) { photoEl.src = src; photoEl.hidden = false; } }).catch(function () {});
+    $('#dlgForm').photo.addEventListener('change', function () {
+      var f = this.files[0];
+      if (f) { photoEl.src = URL.createObjectURL(f); photoEl.hidden = false; }
+    });
+    var r = await pr;
+    if (r.btn.indexOf('unit:') === 0) return openItem(byCode[r.btn.slice(5)]);
+    if (r.btn === 'del') {
+      if (units.length) return toast(ERR_TH.has_items, true);
+      if (await confirmBox('ลบประเภท "' + (p.name || p.type_code) + '"?', 'ลบ')) {
+        try {
+          await api('removeProduct', { type_code: p.type_code });
+          products = products.filter(function (x) { return x.type_code !== p.type_code; }); saveLocal();
+          toast('ลบแล้ว');
+        } catch (e) { toast(errText(e), true); }
+      }
+      return;
+    }
+    if (r.btn !== 'save') return;
+    var d = r.data;
+    toast('กำลังบันทึก…');
+    try {
+      var res = await api('saveProduct', { product: { type_code: p.type_code, name: d.name, category: d.category, brand: d.brand, ref: d.ref, note: d.note } });
+      putProduct(res.product);
+      if (current && current.type === p.type_code) { current.product = res.product; current.status = statusOf(current); renderResult(); }
+      toast('บันทึกแล้ว');
+      if (d.photo) await uploadPhoto(p.type_code, d.photo);
+    } catch (e) { toast(errText(e), true); }
+  }
+
+  var ACT_TH = { scan: 'สแกน', create: 'ลงทะเบียน', update: 'แก้ไข', delete: 'ลบ', rules: 'กฎ', product_create: 'สร้างประเภท', product_update: 'แก้ประเภท', product_image: 'รูป', product_delete: 'ลบประเภท' };
   async function openHistory(code) {
-    var p = dialog('<h3>ประวัติ · ' + esc(code) + '</h3><div id="histBody" class="muted">กำลังโหลด…</div>', [['ปิด']]);
+    var p = dialog('<h3>ประวัติ</h3><p class="small muted" style="margin:0">' + esc(code) + '</p><div id="histBody" class="muted">กำลังโหลด…</div>', [['ปิด']]);
     try {
       var r = await api('history', { code: code, limit: 40 });
       var b = $('#histBody');
@@ -377,28 +609,73 @@
   }
 
   /* ---------- stock list ---------- */
+  function fillDatalists() {
+    var uniq = function (arr) { return arr.filter(function (v, i) { return v && arr.indexOf(v) === i; }).sort(); };
+    var opt = function (v) { return '<option value="' + esc(v) + '">'; };
+    var cats = uniq(products.map(function (p) { return p.category; }));
+    $('#dlCategory').innerHTML = cats.map(opt).join('');
+    $('#dlBrand').innerHTML = uniq(products.map(function (p) { return p.brand; })).map(opt).join('');
+    $('#dlLocation').innerHTML = uniq(items.map(function (i) { return i.location; })).map(opt).join('');
+    var sel = $('#catFilter'), v = sel.value;
+    sel.innerHTML = '<option value="">ทุกหมวดหมู่</option>' + cats.map(function (c) { return '<option' + (c === v ? ' selected' : '') + '>' + esc(c) + '</option>'; }).join('');
+  }
+
   function renderStock() {
     var q = ($('#stockSearch').value || '').trim().toLowerCase();
-    var list = items.slice().sort(function (a, b) { return String(b.updated_at).localeCompare(String(a.updated_at)); });
-    if (q) list = list.filter(function (it) { return [it.code, it.name, it.note, it.location].join(' ').toLowerCase().indexOf(q) >= 0; });
-    $('#stockCount').textContent = 'ทั้งหมด ' + items.length + ' รายการ' + (q ? ' · พบ ' + list.length : '');
-    $('#stockList').innerHTML = list.length ? list.map(function (it) {
-      return '<li class="tap" data-code="' + esc(it.code) + '"><div class="main"><div class="t">' + esc(it.name || '(ไม่มีชื่อ)') + '</div>' +
-        '<div class="s">' + esc(it.code) + (it.location ? ' · ' + esc(it.location) : '') + (it.note ? ' · ' + esc(it.note) : '') + '</div></div>' +
-        (it.qty !== '' && it.qty != null ? '<div class="qty">' + esc(it.qty) + ' ' + esc(it.unit || '') + '</div>' : '') + '</li>';
-    }).join('') : '<li class="empty">' + (items.length ? 'ไม่พบรายการที่ค้นหา' : 'ยังไม่มีสินค้าในคลัง — ไปสแกนเพื่อลงทะเบียน') + '</li>';
+    var cat = $('#catFilter').value;
+    var hit = function (arr) { return !q || arr.join(' ').toLowerCase().indexOf(q) >= 0; };
+    var list, html;
+    if (stockMode === 'products') {
+      list = products.filter(function (p) { return (!cat || p.category === cat) && hit([p.type_code, p.name, p.ref, p.category, p.brand, p.note]); })
+        .sort(function (a, b) { return String(a.name).localeCompare(String(b.name), 'th'); });
+      html = list.map(function (p) {
+        var n = unitsOf(p.type_code).length;
+        return '<li class="tap" data-type="' + esc(p.type_code) + '">' + thumb(p) + '<div class="main"><div class="t">' + esc(p.name || '(ไม่มีชื่อ)') + '</div>' +
+          '<div class="s">' + esc([p.ref, p.category, p.brand].filter(Boolean).join(' · ') || p.type_code) + '</div></div>' +
+          '<div class="qty">' + (n ? totalOf(p.type_code) : '<span class="muted small">ไม่มีของ</span>') + '</div></li>';
+      }).join('');
+      $('#stockCount').textContent = 'ประเภทสินค้า ' + products.length + ' รายการ' + (q || cat ? ' · พบ ' + list.length : '');
+    } else {
+      list = items.filter(function (it) {
+        var p = byType[it.type_code] || {};
+        return (!cat || p.category === cat) && hit([it.code, it.serial, it.lot, it.ref, it.location, it.note, p.name, p.category, p.brand]);
+      }).sort(function (a, b) { return String(b.updated_at).localeCompare(String(a.updated_at)); });
+      html = list.map(function (it) {
+        var p = byType[it.type_code];
+        var id = it.serial ? 'SN ' + it.serial : it.lot ? 'LOT ' + it.lot : it.type_code;
+        return '<li class="tap" data-code="' + esc(it.code) + '">' + thumb(p) + '<div class="main"><div class="t">' + esc((p && p.name) || it.type_code) + '</div>' +
+          '<div class="s">' + esc([id, it.location, it.note].filter(Boolean).join(' · ')) + '</div>' + (it.exp_date ? '<div>' + expBadge(it.exp_date) + '</div>' : '') + '</div>' +
+          (it.serial ? '' : '<div class="qty">' + esc(it.qty) + ' ' + esc(it.unit || '') + '</div>') + '</li>';
+      }).join('');
+      $('#stockCount').textContent = 'ในคลัง ' + items.length + ' รายการ' + (q || cat ? ' · พบ ' + list.length : '');
+    }
+    var empty = (stockMode === 'products' ? products : items).length ? 'ไม่พบรายการที่ค้นหา' : 'ยังไม่มีข้อมูล — ไปสแกนเพื่อลงทะเบียน';
+    $('#stockList').innerHTML = html || '<li class="empty">' + empty + '</li>';
   }
   $('#stockSearch').addEventListener('input', renderStock);
+  $('#catFilter').addEventListener('change', renderStock);
+  document.querySelectorAll('.seg button').forEach(function (b) {
+    b.addEventListener('click', function () {
+      stockMode = b.dataset.mode;
+      document.querySelectorAll('.seg button').forEach(function (x) { x.classList.toggle('on', x === b); });
+      renderStock();
+    });
+  });
   $('#stockList').addEventListener('click', function (e) {
-    var li = e.target.closest('li[data-code]');
-    if (li) openItem(byCode[li.dataset.code]);
+    var li = e.target.closest('li.tap');
+    if (!li) return;
+    if (li.dataset.type) openProduct(byType[li.dataset.type]);
+    else openItem(byCode[li.dataset.code]);
   });
   $('#btnRefresh').addEventListener('click', function () { var b = this; busy(b, function () { return syncAll(false); }); });
-  $('#btnAddManual').addEventListener('click', function () { openItem(null); });
+  $('#btnAddManual').addEventListener('click', function () { recode(true); });
   $('#btnExport').addEventListener('click', function () {
-    var cols = ['code', 'name', 'note', 'qty', 'unit', 'location', 'format', 'created_at', 'updated_at', 'scan_count', 'last_scan'];
+    var cols = ['type_code', 'name', 'category', 'brand', 'ref', 'serial', 'lot', 'mfg_date', 'exp_date', 'qty', 'unit', 'location', 'note', 'created_at', 'updated_at', 'scan_count', 'last_scan'];
+    var cell = function (v) { v = v == null ? '' : String(v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
     var csv = '\ufeff' + cols.join(',') + '\n' + items.map(function (it) {
-      return cols.map(function (k) { var v = it[k] == null ? '' : String(it[k]); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }).join(',');
+      var p = byType[it.type_code] || {};
+      var row = Object.assign({}, it, { name: p.name, category: p.category, brand: p.brand, ref: it.ref || p.ref });
+      return cols.map(function (k) { return cell(row[k]); }).join(',');
     }).join('\n');
     var a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
@@ -408,6 +685,7 @@
   });
 
   /* ---------- rules ---------- */
+  var ROLE_TH = { type: 'ประเภทสินค้า', serial: 'Serial (รายเครื่อง)', lot: 'Lot (ล็อต)' };
   var MATCH_TH = { any: 'ทุกโค้ด', gs1: 'เป็น GS1', url: 'เป็นลิงก์ URL', digits: 'เป็นตัวเลขล้วน', contains: 'มีข้อความ', startsWith: 'ขึ้นต้นด้วย', regex: 'ตรงกับ Regex' };
   var EXTRACT_TH = { whole: 'ใช้ค่าทั้งหมด', gs1: 'ค่าจาก GS1 AI', split: 'แยกด้วยตัวคั่น เอาช่องที่…', between: 'ข้อความระหว่าง…', substring: 'ตัดตามตำแหน่งตัวอักษร', urlParam: 'ค่าพารามิเตอร์ใน URL (?x=)', urlPath: 'ส่วนของ path ใน URL', jsonKey: 'ค่าจาก JSON key', regex: 'Regex (กลุ่มที่จับได้)' };
 
@@ -427,13 +705,13 @@
     $('#ruleList').innerHTML = rules.length ? rules.map(function (r, i) {
       return '<li class="' + (r.enabled === false ? 'off' : '') + '" data-i="' + i + '">' +
         '<label class="check" style="min-height:0"><input type="checkbox" data-r="toggle" ' + (r.enabled === false ? '' : 'checked') + ' aria-label="เปิดใช้"></label>' +
-        '<div class="main tap" data-r="edit"><div class="t">' + (i + 1) + '. ' + esc(r.name) + '</div><div class="s">' + esc(ruleSummary(r)) + '</div></div>' +
+        '<div class="main tap" data-r="edit"><div class="t">' + esc(r.name) + '<span class="role-chip">' + esc(ROLE_TH[r.role || 'type']) + '</span></div><div class="s">' + esc(ruleSummary(r)) + '</div></div>' +
         '<div class="rule-btns"><button class="btn" type="button" data-r="up" aria-label="เลื่อนขึ้น">↑</button><button class="btn" type="button" data-r="down" aria-label="เลื่อนลง">↓</button></div></li>';
-    }).join('') : '<li class="empty">ยังไม่มีกฎ — ระบบจะใช้ค่าทั้งหมดเป็นรหัส</li>';
+    }).join('') : '<li class="empty">ยังไม่มีกฎ — ระบบจะใช้ค่าทั้งหมดเป็นรหัสประเภท</li>';
     $('#btnSaveRules').disabled = !rulesDirty;
     renderRuleTest();
   }
-  function markRules() { rulesDirty = true; store('rules', rules); renderRules(); }
+  function markRules() { rulesDirty = true; store('rules2', rules); renderRules(); }
 
   $('#ruleList').addEventListener('click', function (e) {
     var t = e.target.closest('[data-r]'); if (!t) return;
@@ -456,17 +734,18 @@
   function opt(map, sel) { return Object.keys(map).map(function (k) { return '<option value="' + k + '"' + (k === sel ? ' selected' : '') + '>' + esc(map[k]) + '</option>'; }).join(''); }
 
   async function editRule(i) {
-    var r = i >= 0 ? JSON.parse(JSON.stringify(rules[i])) : { id: 'r_' + Date.now().toString(36), name: '', enabled: true, match: { type: 'any' }, extract: { type: 'whole' }, post: {} };
+    var r = i >= 0 ? JSON.parse(JSON.stringify(rules[i])) : { id: 'r_' + Date.now().toString(36), name: '', role: 'type', enabled: true, match: { type: 'any' }, extract: { type: 'whole' }, post: {} };
     var m = r.match || {}, x = r.extract || {}, p = r.post || {};
     var html = '<h3>' + (i >= 0 ? 'แก้ไขกฎ' : 'เพิ่มกฎ') + '</h3>' +
-      '<label>ชื่อกฎ<input name="name" value="' + esc(r.name) + '" placeholder="เช่น QR ใบส่งของ → ช่องที่ 2"></label>' +
+      '<label>ชื่อกฎ<input name="name" value="' + esc(r.name) + '" placeholder="เช่น QR ใบส่งของ → ช่อง 2"></label>' +
+      '<label>ค่าที่ได้ใช้เป็น<select name="role">' + opt(ROLE_TH, r.role || 'type') + '</select></label>' +
       '<fieldset class="card" style="box-shadow:none"><b>1) ใช้กับโค้ดแบบไหน</b>' +
       '<label>เงื่อนไข<select name="mtype">' + opt(MATCH_TH, m.type || 'any') + '</select></label>' +
       '<label data-show="mval">ค่า<input name="mval" value="' + esc(m.value) + '" placeholder="ข้อความ / regex / จำนวนหลัก"></label>' +
-      '<label>ชนิดโค้ด (ไม่บังคับ)<input name="mformat" value="' + esc(m.format) + '" placeholder="เช่น QR_CODE, EAN_13, CODE_128"></label></fieldset>' +
-      '<fieldset class="card" style="box-shadow:none"><b>2) อ่านค่าอะไรมาเป็นรหัสสินค้า</b>' +
+      '<label>ชนิดโค้ด (ไม่บังคับ)<input name="mformat" value="' + esc(m.format) + '" placeholder="เช่น QR_CODE, DATA_MATRIX, CODE_128"></label></fieldset>' +
+      '<fieldset class="card" style="box-shadow:none"><b>2) อ่านค่าอะไร</b>' +
       '<label>วิธี<select name="xtype">' + opt(EXTRACT_TH, x.type || 'whole') + '</select></label>' +
-      '<label data-show="gs1">GS1 AI<select name="ai">' + opt({ '01': '(01) GTIN', '10': '(10) Lot/Batch', '21': '(21) Serial', '17': '(17) วันหมดอายุ', '240': '(240) Additional ID', '00': '(00) SSCC' }, x.ai || '01') + '</select></label>' +
+      '<label data-show="gs1">GS1 AI<select name="ai">' + opt({ '01': '(01) GTIN', '21': '(21) Serial', '10': '(10) Lot/Batch', '240': '(240) REF / Additional ID', '17': '(17) วันหมดอายุ', '11': '(11) วันผลิต', '00': '(00) SSCC' }, x.ai || '01') + '</select></label>' +
       '<div class="grid2" data-show="split"><label>ตัวคั่น<input name="delimiter" value="' + esc(x.delimiter || '|') + '" placeholder="| , ; \\t"></label><label>ช่องที่ (−1 = สุดท้าย)<input name="sindex" type="number" value="' + esc(x.index || 1) + '"></label></div>' +
       '<div class="grid2" data-show="between"><label>หลังข้อความ<input name="after" value="' + esc(x.after) + '"></label><label>ก่อนข้อความ<input name="before" value="' + esc(x.before) + '"></label></div>' +
       '<div class="grid2" data-show="substring"><label>เริ่มตัวที่<input name="start" type="number" min="1" value="' + esc(x.start || 1) + '"></label><label>ความยาว (ว่าง = ถึงท้าย)<input name="length" type="number" min="1" value="' + esc(x.length) + '"></label></div>' +
@@ -485,7 +764,7 @@
     var form = $('#dlgForm');
     function read() {
       var f = {}; form.querySelectorAll('[name]').forEach(function (el) { f[el.name] = el.type === 'checkbox' ? el.checked : el.value; });
-      var nr = { id: r.id, name: f.name.trim() || 'กฎไม่มีชื่อ', enabled: r.enabled !== false, match: { type: f.mtype }, extract: { type: f.xtype }, post: {} };
+      var nr = { id: r.id, name: f.name.trim() || 'กฎไม่มีชื่อ', role: f.role, enabled: r.enabled !== false, match: { type: f.mtype }, extract: { type: f.xtype }, post: {} };
       if (f.mval && ['contains', 'startsWith', 'regex', 'digits'].indexOf(f.mtype) >= 0) nr.match.value = f.mval;
       if (f.mformat.trim()) nr.match.format = f.mformat.trim().toUpperCase();
       var X = nr.extract;
@@ -540,15 +819,20 @@
     var info = R.inspect(s, '');
     var a = R.apply(rules, s, '');
     var rows = rules.map(function (r) {
+      var role = ROLE_TH[r.role || 'type'];
       if (r.enabled === false) return '<div class="test-row skip"><span>' + esc(r.name) + '</span><span>ปิดอยู่</span></div>';
       var ok = R.matches(r, s, '');
       var v = ok ? R.post(r, R.extract(r, s)) : '';
-      var win = a.rule && a.rule.id === r.id;
-      return '<div class="test-row' + (win ? ' win' : ok ? '' : ' skip') + '"><span>' + (win ? '✓ ' : '') + esc(r.name) + '</span><span class="v">' + (ok ? (v ? esc(v) : '(ว่าง)') : 'ไม่ตรง') + '</span></div>';
+      var win = a.used[r.role || 'type'] === r;
+      return '<div class="test-row' + (win ? ' win' : ok ? '' : ' skip') + '"><span>' + (win ? '✓ ' : '') + esc(r.name) + '<span class="role-chip">' + esc(role) + '</span></span><span class="v">' + (ok ? (v ? esc(v) : '(ว่าง)') : 'ไม่ตรง') + '</span></div>';
     }).join('');
     out.innerHTML = '<p class="small" style="margin:6px 0">ชนิด: <b>' + esc(info.label) + '</b></p>' +
       (info.details.length ? '<dl class="kv">' + info.details.map(function (d) { return '<dt>' + esc(d[0]) + '</dt><dd>' + esc(d[1]) + '</dd>'; }).join('') + '</dl>' : '') +
-      rows + '<div class="test-row win"><span>รหัสสินค้าที่ได้</span><span class="v">' + esc(a.code) + '</span></div>';
+      rows +
+      '<div class="test-row win"><span>ประเภทสินค้า</span><span class="v">' + esc(a.type) + (a.used.type ? '' : ' (ค่าทั้งหมด)') + '</span></div>' +
+      (a.serial ? '<div class="test-row win"><span>Serial → นับรายเครื่อง</span><span class="v">' + esc(a.serial) + '</span></div>' : '') +
+      (a.lot ? '<div class="test-row win"><span>Lot' + (a.serial ? ' (เก็บไว้)' : ' → นับตามล็อต') + '</span><span class="v">' + esc(a.lot) + '</span></div>' : '') +
+      (!a.serial && !a.lot ? '<div class="test-row"><span>ไม่มี Serial/Lot → นับจำนวนตามประเภท</span><span></span></div>' : '');
   }
   $('#ruleSample').addEventListener('input', renderRuleTest);
 
@@ -579,7 +863,8 @@
   });
   $('#btnClearCfg').addEventListener('click', async function () {
     if (!(await confirmBox('ล้างการตั้งค่าการเชื่อมต่อและข้อมูลที่เก็บไว้ในเครื่องนี้? (ข้อมูลใน Google Sheet ไม่หาย)', 'ล้าง'))) return;
-    cfg = { url: '', key: '', device: '' }; store('cfg', cfg); setItems([]); fillSettings(); setConn(null);
+    cfg = { url: '', key: '', device: '' }; store('cfg', cfg);
+    items = []; products = []; saveLocal(); fillSettings(); setConn(null);
     $('#cfgStatus').textContent = 'ล้างแล้ว';
   });
   $('#optBeep').addEventListener('change', function () { opts.beep = this.checked; store('opts', opts); });
@@ -600,7 +885,10 @@
   }
 
   /* ---------- boot ---------- */
+  try { localStorage.removeItem('qrs.items'); localStorage.removeItem('qrs.rules'); } catch (e) { /* v1.0 leftovers */ }
+  reindex();
   fillSettings();
+  fillDatalists();
   renderStock();
   renderRules();
   if (cfg.url && cfg.key) syncAll(true); else setConn(null);
