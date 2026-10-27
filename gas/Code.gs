@@ -6,15 +6,18 @@
  * Two levels:
  *   Products — one row per product type (key: type_code = GTIN for GS1 codes)
  *   Items    — one row per stock unit (key: code = type|SN:serial, type|LOT:lot, or type)
+ *   Groups   — work lists ("what goes where"), members in GroupItems (an item may be in several groups)
  */
-var VERSION = '1.5.0';
+var VERSION = '1.6.0';
 
 var SHEETS = {
   Products: ['type_code', 'ref', 'name', 'category', 'brand', 'note', 'image_id', 'thumb', 'created_at', 'updated_at'],
   Items: ['code', 'type_code', 'serial', 'lot', 'ref', 'mfg_date', 'exp_date', 'qty', 'unit', 'location', 'note', 'fields', 'format', 'raw_sample', 'created_at', 'updated_at', 'scan_count', 'last_scan'],
   Log: ['ts', 'action', 'code', 'raw', 'detail', 'device'],
   Config: ['key', 'value'],
-  Images: ['image_id', 'seq', 'type_code', 'mime', 'data'] // photo base64 split into ≤45k-char chunks (cell limit 50k)
+  Images: ['image_id', 'seq', 'type_code', 'mime', 'data'], // photo base64 split into ≤45k-char chunks (cell limit 50k)
+  Groups: ['group_id', 'name', 'place', 'date', 'note', 'created_at', 'updated_at'],
+  GroupItems: ['group_id', 'code', 'added_at']
 };
 // columns that must stay text (barcodes lose leading zeros, dates get reinterpreted otherwise)
 var TEXT_COLS = {
@@ -22,7 +25,9 @@ var TEXT_COLS = {
   Items: ['code', 'type_code', 'serial', 'lot', 'ref', 'mfg_date', 'exp_date', 'fields', 'raw_sample'],
   Log: ['code', 'raw'],
   Config: ['key', 'value'],
-  Images: ['image_id', 'type_code', 'data']
+  Images: ['image_id', 'type_code', 'data'],
+  Groups: ['group_id', 'date'],
+  GroupItems: ['group_id', 'code']
 };
 var CHUNK = 45000;
 var MAX_IMAGE_CHARS = 600000; // ~450 KB jpeg
@@ -50,12 +55,18 @@ function doPost(e) {
     if (props.getProperty('SCHEMA_OK') !== VERSION) ensureSheets_(); else schemaOk_ = true;
     switch (req.action) {
       case 'ping': return json_({ ok: true, version: VERSION, sheet: SpreadsheetApp.getActiveSpreadsheet().getUrl() });
-      case 'list': return json_({ ok: true, items: read_('Items').rows, products: read_('Products').rows });
+      case 'list': return json_({ ok: true, items: read_('Items').rows, products: read_('Products').rows, groups: read_('Groups').rows, members: read_('GroupItems').rows });
       case 'scan': return json_(withLock_(function () { return scan_(req); }));
       case 'saveItem': return json_(withLock_(function () { return saveItem_(req); }));
       case 'saveBatch': return json_(withLock_(function () { return saveBatch_(req); }));
       case 'saveProduct': return json_(withLock_(function () { return { ok: true, product: upsertProduct_(req.product || {}, req.device) }; }));
-      case 'removeItem': return json_(withLock_(function () { return removeItem_(req); }));
+      case 'removeItem': return json_(withLock_(function () { return removeItems_({ codes: [req.code], device: req.device }); }));
+      case 'removeItems': return json_(withLock_(function () { return removeItems_(req); }));
+      case 'bulkUpdate': return json_(withLock_(function () { return bulkUpdate_(req); }));
+      case 'saveGroup': return json_(withLock_(function () { return saveGroup_(req); }));
+      case 'removeGroup': return json_(withLock_(function () { return removeGroup_(req); }));
+      case 'groupAdd': return json_(withLock_(function () { return { ok: true, members: groupAdd_(req.group_id, req.codes || []) }; }));
+      case 'groupRemove': return json_(withLock_(function () { return groupRemove_(req); }));
       case 'removeProduct': return json_(withLock_(function () { return removeProduct_(req); }));
       case 'uploadImage': return json_(withLock_(function () { return uploadImage_(req); }));
       case 'image': return json_(image_(req));
@@ -183,16 +194,120 @@ function saveBatch_(req) {
   });
   appendRows_('Items', newRows);
   appendRows_('Log', logs);
-  return { ok: true, results: results, products: products };
+  var members = [];
+  if (req.group_id) {
+    members = groupAdd_(clean_(req.group_id), results.filter(function (r) { return r.status === 'created' || r.status === 'exists'; })
+      .map(function (r) { return r.code; }));
+  }
+  return { ok: true, results: results, products: products, members: members };
 }
 
-function removeItem_(req) {
-  var code = clean_(req.code);
-  var hit = find_('Items', code);
+function removeItems_(req) {
+  var codes = (req.codes || []).map(clean_).filter(Boolean);
+  var data = read_('Items');
+  var rows = [];
+  codes.forEach(function (code) { if (data.index[code] !== undefined) rows.push(data.index[code] + 2); });
+  if (!rows.length) return { ok: false, error: 'not_found' };
+  deleteRows_(data.sheet, rows);
+  dropMembers_(function (m) { return codes.indexOf(m.code) >= 0; });
+  appendRows_('Log', codes.map(function (code) { return [new Date(), 'delete', code, '', 'ลบออกจากคลัง', String(req.device || '').slice(0, 60)]; }));
+  return { ok: true, removed: rows.length };
+}
+
+// set the same fields on many rows: location / unit replace, note replace or append
+function bulkUpdate_(req) {
+  var codes = (req.codes || []).map(clean_).filter(Boolean);
+  var set = req.set || {};
+  var data = read_('Items');
+  var now = new Date(), out = [], logs = [];
+  codes.forEach(function (code) {
+    var idx = data.index[code];
+    if (idx === undefined) return;
+    var rec = data.rows[idx], parts = [];
+    ['location', 'unit'].forEach(function (k) {
+      if (set[k] !== undefined && set[k] !== null) { rec[k] = String(set[k]); parts.push(k + ' → ' + set[k]); }
+    });
+    if (set.note) {
+      rec.note = req.noteMode === 'append' && rec.note ? rec.note + '\n' + set.note : String(set.note);
+      parts.push('note: ' + String(set.note).slice(0, 200));
+    }
+    if (!parts.length) return;
+    rec.updated_at = now;
+    ['created_at', 'last_scan'].forEach(function (k) { if (rec[k]) rec[k] = new Date(rec[k]); });
+    writeRow_('Items', idx, rec);
+    out.push(serialize_(rec));
+    logs.push([now, 'update', code, '', 'แก้ไขหลายรายการ · ' + parts.join(' · '), String(req.device || '').slice(0, 60)]);
+  });
+  appendRows_('Log', logs);
+  return { ok: true, items: out };
+}
+
+/* ---------- groups ---------- */
+
+function saveGroup_(req) {
+  var g = req.group || {};
+  var id = clean_(g.group_id) || Utilities.getUuid().slice(0, 8);
+  if (!clean_(g.name)) return { ok: false, error: 'empty_name' };
+  var hit = find_('Groups', id);
+  var cur = hit ? hit.obj : {};
+  var now = new Date();
+  var rec = { group_id: id, name: clean_(g.name), place: clean_(g.place), date: clean_(g.date), note: String(g.note || ''),
+    created_at: cur.created_at ? new Date(cur.created_at) : now, updated_at: now };
+  writeRow_('Groups', hit ? hit.idx : undefined, rec);
+  log_(hit ? 'group_update' : 'group_create', id, '', (hit ? 'แก้ไขกลุ่ม ' : 'สร้างกลุ่ม ') + rec.name, req.device);
+  var members = req.codes && req.codes.length ? groupAdd_(id, req.codes) : [];
+  return { ok: true, group: serialize_(rec), members: members };
+}
+
+function removeGroup_(req) {
+  var id = clean_(req.group_id);
+  var hit = find_('Groups', id);
   if (!hit) return { ok: false, error: 'not_found' };
   hit.sheet.deleteRow(hit.idx + 2);
-  log_('delete', code, '', 'ลบออกจากคลัง', req.device);
+  dropMembers_(function (m) { return m.group_id === id; });
+  log_('group_delete', id, '', 'ลบกลุ่ม ' + hit.obj.name, req.device);
   return { ok: true };
+}
+
+// -> the new membership rows (codes already in the group are skipped)
+function groupAdd_(id, codes) {
+  if (!id) return [];
+  var have = {};
+  read_('GroupItems').rows.forEach(function (m) { if (m.group_id === id) have[m.code] = 1; });
+  var now = new Date(), rows = [], out = [];
+  codes.map(clean_).forEach(function (code) {
+    if (!code || have[code]) return;
+    have[code] = 1;
+    rows.push([id, code, now]);
+    out.push({ group_id: id, code: code, added_at: now.toISOString() });
+  });
+  appendRows_('GroupItems', rows);
+  return out;
+}
+
+function groupRemove_(req) {
+  var id = clean_(req.group_id), codes = (req.codes || []).map(clean_);
+  var n = dropMembers_(function (m) { return m.group_id === id && codes.indexOf(m.code) >= 0; });
+  return { ok: true, removed: n };
+}
+
+function dropMembers_(test) {
+  var d = read_('GroupItems');
+  var rows = [];
+  d.rows.forEach(function (m, i) { if (test(m)) rows.push(i + 2); });
+  deleteRows_(d.sheet, rows);
+  return rows.length;
+}
+
+// delete sheet rows bottom-up, merging runs of adjacent rows into one call
+function deleteRows_(sh, rows) {
+  rows = rows.slice().sort(function (a, b) { return b - a; });
+  for (var i = 0; i < rows.length;) {
+    var j = i;
+    while (j + 1 < rows.length && rows[j + 1] === rows[j] - 1) j++;
+    sh.deleteRows(rows[j], i === j ? 1 : rows[i] - rows[j] + 1);
+    i = j + 1;
+  }
 }
 
 function removeProduct_(req) {
@@ -394,7 +509,7 @@ function rowObj_(cols, r) {
   });
   return o;
 }
-var TEXT_COLS_ALL_ = { code: 1, type_code: 1, serial: 1, lot: 1, ref: 1, mfg_date: 1, exp_date: 1 };
+var TEXT_COLS_ALL_ = { code: 1, type_code: 1, serial: 1, lot: 1, ref: 1, mfg_date: 1, exp_date: 1, group_id: 1, date: 1 };
 
 function serialize_(rec) {
   var o = {};
