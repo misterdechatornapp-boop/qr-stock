@@ -140,6 +140,17 @@ label.check input { width: 20px; min-height: 20px; height: 20px; accent-color: v
 #camOverlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 .count-pill { display: inline-block; min-width: 20px; padding: 0 6px; margin-left: 4px; border-radius: 99px; background: var(--brand); color: var(--brand-ink); font-size: 12px; line-height: 20px; }
 .batch-row .main { cursor: pointer; }
+/* SN rank within the model: big number = where this unit goes when lined up by SN */
+.rank {
+  width: 48px; height: 48px; flex: none; border-radius: 12px; background: var(--brand-soft); color: var(--brand);
+  display: flex; align-items: baseline; justify-content: center; padding-top: 6px; line-height: 1;
+}
+.rank b { font-size: 26px; font-weight: 800; }
+.rank span { font-size: 12px; font-weight: 700; opacity: .75; }
+.seg.mini button { min-height: 32px; font-size: 13px; }
+#batchPanel > .toolbar { flex-wrap: wrap; }
+#batchPanel > .toolbar h2 { flex: 1 1 100%; }
+#batchPanel > .toolbar .btn { flex: 1; }
 .batch-row .chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
 .batch-row .acts { display: flex; gap: 4px; }
 .batch-row .acts .btn { width: 36px; min-height: 36px; padding: 0; }

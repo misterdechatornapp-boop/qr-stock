@@ -1,7 +1,7 @@
 /* QR Stock — UI */
 (function () {
   'use strict';
-  var APP_VERSION = '1.6.1';
+  var APP_VERSION = '1.6.2';
   var SETUP_PREFIX = 'QRSTOCK-SETUP:';
   var R = window.QRRules;
 
@@ -1042,11 +1042,27 @@
     if (batchGroup && !tg) batchGroup = '';
     $('#btnBatchGroup').innerHTML = tg ? '👥 ' + esc(tg.name) : '👥 ใส่กลุ่ม';
     $('#btnBatchGroup').classList.toggle('primary', !!tg);
-    $('#batchList').innerHTML = batch.map(function (e) {
+    // where each SN falls when that model's scanned units are put in SN order (1 = lowest), recomputed on every add
+    var bySerial = {}, rank = {};
+    batch.forEach(function (e) { if (e.serial) (bySerial[e.type] = bySerial[e.type] || []).push(e); });
+    Object.keys(bySerial).forEach(function (t) {
+      var list = bySerial[t].slice().sort(function (a, b) { return nat(a.serial, b.serial); });
+      list.forEach(function (e, i) { rank[e.code] = { r: i + 1, n: list.length }; });
+    });
+    var bsort = store('batchSort') || 'scan';
+    document.querySelectorAll('#batchSortSeg button').forEach(function (b) { b.classList.toggle('on', b.dataset.bs === bsort); });
+    $('#batchSortSeg').hidden = !Object.keys(rank).length;
+    var shown = bsort === 'sn' ? batch.slice().sort(function (a, b) {
+      var na = (byType[a.type] || {}).name || a.type, nb = (byType[b.type] || {}).name || b.type;
+      return na.localeCompare(nb, 'th') || a.type.localeCompare(b.type) || (!a.serial - !b.serial) || nat(a.serial || a.lot, b.serial || b.lot);
+    }) : batch;
+    $('#batchList').innerHTML = shown.map(function (e) {
       var p = byType[e.type], s = rowStatus(e);
       var id = e.serial ? 'SN ' + e.serial : e.lot ? 'LOT ' + e.lot : e.type;
       var extra = [e.location, e.note].filter(Boolean).join(' · ');
-      return '<li class="batch-row" data-code="' + esc(e.code) + '">' + thumb(p) +
+      var rk = rank[e.code];
+      return '<li class="batch-row" data-code="' + esc(e.code) + '">' +
+        (rk ? '<div class="rank" title="ลำดับ SN ในรุ่นนี้"><b>' + rk.r + '</b><span>/' + rk.n + '</span></div>' : thumb(p)) +
         '<div class="main" data-b="open"><div class="t">' + esc((p && p.name) || e.type) + '</div>' +
         '<div class="s">' + esc(id) + (extra ? ' · ' + esc(extra) : '') + '</div>' +
         '<div class="chips">' + ROW_CHIP[s] + (e.ocr ? '<span class="badge warn">OCR</span>' : '') + (e.exp_date ? expBadge(e.exp_date) : '') +
@@ -1080,6 +1096,10 @@
     if (!e.serial) { e.qty = r.data.qty; e.unit = r.data.unit; }
     e.location = r.data.location.trim(); e.note = r.data.note.trim();
     batchSave();
+  });
+
+  document.querySelectorAll('#batchSortSeg button').forEach(function (b) {
+    b.addEventListener('click', function () { store('batchSort', b.dataset.bs); renderBatch(); });
   });
 
   $('#btnBatchClear').addEventListener('click', async function () {
