@@ -1,7 +1,7 @@
 /* QR Stock — UI */
 (function () {
   'use strict';
-  var APP_VERSION = '1.4.0';
+  var APP_VERSION = '1.5.0';
   var SETUP_PREFIX = 'QRSTOCK-SETUP:';
   var R = window.QRRules;
 
@@ -65,7 +65,7 @@
     items.forEach(function (it) { byCode[it.code] = it; });
     products.forEach(function (p) { byType[p.type_code] = p; });
   }
-  function saveLocal() { reindex(); store('items2', items); store('products', products); renderStock(); fillDatalists(); }
+  function saveLocal() { reindex(); store('items2', items); store('products', products); renderStock(); fillDatalists(); if (window.__qrsBatchReady) renderBatch(); }
   function putItem(it) {
     if (!it) return;
     var i = items.findIndex(function (x) { return x.code === it.code; });
@@ -192,10 +192,13 @@
     if (m === 'no_wasm') return 'เบราว์เซอร์นี้ไม่รองรับ WebAssembly — อัปเดต iOS / เบราว์เซอร์';
     return 'ตัวอ่านบาร์โค้ดเริ่มทำงานไม่ได้: ' + m;
   }
-  async function detectIn(source) {
+  async function detectAll(source) {
     var det = await getDetector();
-    var r = await det.detect(source);
-    return r && r.length ? r[0] : null;
+    return (await det.detect(source)) || [];
+  }
+  async function detectIn(source) {
+    var r = await detectAll(source);
+    return r.length ? r[0] : null;
   }
 
   var SCAN_BOX = { x: 0.07, y: 0.12, w: 0.86, h: 0.76 }; // must match .guide in styles.css
@@ -247,6 +250,7 @@
     if (!camOn) return;
     stopStream();
     camOn = false; paused = false;
+    clearOverlay();
     $('#scannerIdle').hidden = false;
     $('#camGuide').hidden = true;
     $('#camCtrl').hidden = true;
@@ -254,7 +258,7 @@
     $('#btnCam').textContent = 'เปิดกล้อง';
   }
   function resumeCam() {
-    if (camOn && paused) { paused = false; cam.since = Date.now(); $('#camGuide').classList.remove('hit'); scanLoop(); }
+    if (camOn && paused) { paused = false; cam.since = Date.now(); clearOverlay(); $('#camGuide').classList.remove('hit'); scanLoop(); }
   }
 
   // decode the guide-box region of the visible (object-fit: cover, digitally zoomed) frame
@@ -273,18 +277,52 @@
       frameCanvas.width = Math.round(sw * k); frameCanvas.height = Math.round(sh * k);
       frameCanvas.getContext('2d').drawImage(video, sx, sy, sw, sh, 0, 0, frameCanvas.width, frameCanvas.height);
       try {
-        var hit = await detectIn(frameCanvas);
-        if (hit && camOn && !paused) {
-          paused = true;
+        var hits = await detectAll(frameCanvas);
+        var map = { sx: sx, sy: sy, k: k, offX: (vw - visW) / 2, offY: (vh - visH) / 2, scale: scale };
+        if (hits.length && camOn && !paused) {
+          cam.since = Date.now();
           $('#camHint').hidden = true;
-          $('#camGuide').classList.add('hit');
-          handleRaw(hit.rawValue, String(hit.format || '').toUpperCase());
-          return;
-        }
+          if (batchMode || hits.length > 1) {
+            // several codes, or batch mode: collect them all and keep the camera running
+            var states = hits.map(function (h) { return batchAdd(h.rawValue, String(h.format || '').toUpperCase()); });
+            drawHits(hits, map, states);
+            if (!batchMode) { setMode('batch'); toast('พบ ' + hits.length + ' โค้ดในภาพ — เพิ่มเข้ารายการรอตรวจ'); }
+          } else {
+            paused = true;
+            drawHits(hits, map, ['new']);
+            $('#camGuide').classList.add('hit');
+            handleRaw(hits[0].rawValue, String(hits[0].format || '').toUpperCase());
+            return;
+          }
+        } else if (Date.now() - overlayAt > 500) clearOverlay();
       } catch (e) { /* keep scanning */ }
     }
     $('#camHint').hidden = Date.now() - cam.since < HINT_AFTER;
-    cam.timer = setTimeout(scanLoop, 80);
+    cam.timer = setTimeout(scanLoop, batchMode ? 120 : 80);
+  }
+
+  // outline detected codes on top of the live video (green = just added, teal = already in the list)
+  var overlay = $('#camOverlay'), overlayAt = 0;
+  function clearOverlay() { var g = overlay.getContext('2d'); g.clearRect(0, 0, overlay.width, overlay.height); }
+  function drawHits(hits, m, states) {
+    var dpr = window.devicePixelRatio || 1, r = overlay.getBoundingClientRect();
+    overlay.width = Math.round(r.width * dpr); overlay.height = Math.round(r.height * dpr);
+    var g = overlay.getContext('2d');
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, r.width, r.height);
+    var pt = function (p) { return [(m.sx + p.x / m.k - m.offX) * m.scale, (m.sy + p.y / m.k - m.offY) * m.scale]; };
+    hits.forEach(function (h, i) {
+      var pts = h.cornerPoints && h.cornerPoints.length ? h.cornerPoints : [
+        { x: h.boundingBox.x, y: h.boundingBox.y }, { x: h.boundingBox.x + h.boundingBox.width, y: h.boundingBox.y },
+        { x: h.boundingBox.x + h.boundingBox.width, y: h.boundingBox.y + h.boundingBox.height }, { x: h.boundingBox.x, y: h.boundingBox.y + h.boundingBox.height }];
+      var col = states[i] === 'new' || states[i] === 'count' ? '#22c55e' : '#2dd4bf';
+      g.beginPath();
+      pts.forEach(function (p, j) { var q = pt(p); if (j) g.lineTo(q[0], q[1]); else g.moveTo(q[0], q[1]); });
+      g.closePath();
+      g.lineWidth = 3; g.strokeStyle = col; g.fillStyle = col + '33';
+      g.fill(); g.stroke();
+    });
+    overlayAt = Date.now();
   }
 
   // zoom: real optical/sensor zoom when the camera exposes it, otherwise a digital crop of the 1080p frame
@@ -327,19 +365,21 @@
   document.addEventListener('visibilitychange', function () { if (document.hidden) stopCam(); });
 
   // photo path: the phone's camera app (macro + HDR) or an album picture → decode at a few sizes
+  // -> every distinct code; big and small codes can need different sizes, so the first two sizes are merged
   async function decodePhoto(f) {
     var bmp = await createImageBitmap(f);
     var longest = Math.max(bmp.width, bmp.height);
     var sizes = [Math.min(longest, 2000), longest, 1200].filter(function (v, i, a) {
       return v <= longest && a.slice(0, i).every(function (u) { return Math.abs(u - v) > v * 0.15; }); // skip near-duplicate sizes
     });
+    var found = {}, list = [];
     for (var i = 0; i < sizes.length; i++) {
+      if (i === 2 && list.length) break; // the small fallback size only when nothing was found yet
       var k = sizes[i] / longest;
       var src = k === 1 ? bmp : await createImageBitmap(bmp, { resizeWidth: Math.round(bmp.width * k), resizeHeight: Math.round(bmp.height * k), resizeQuality: 'high' });
-      var hit = await detectIn(src);
-      if (hit) return hit;
+      (await detectAll(src)).forEach(function (h) { if (!found[h.rawValue]) { found[h.rawValue] = 1; list.push(h); } });
     }
-    return null;
+    return list;
   }
   async function onPhotoPicked(e) {
     var f = e.target.files[0]; e.target.value = '';
@@ -349,8 +389,15 @@
     try { await getDetector(); } catch (err) { return toast(decoderError(err), true); }
     getOcr().catch(function () {}); // warm the OCR engine in parallel in case the code turns out unreadable
     try {
-      var hit = await decodePhoto(f);
-      if (hit) return handleRaw(hit.rawValue, String(hit.format || '').toUpperCase());
+      var hits = await decodePhoto(f);
+      if (hits.length > 1 || (hits.length && batchMode)) {
+        var added = hits.map(function (h) { return batchAdd(h.rawValue, String(h.format || '').toUpperCase()); })
+          .filter(function (x) { return x === 'new'; }).length;
+        setMode('batch');
+        toast('พบ ' + hits.length + ' โค้ดในรูป — เพิ่มใหม่ ' + added + ' รายการ');
+        return;
+      }
+      if (hits.length) return handleRaw(hits[0].rawValue, String(hits[0].format || '').toUpperCase());
       // code unreadable → read the printed "(01)… (21)…" text on the label instead
       if (await ocrLabel(f)) return;
       throw new Error('none');
@@ -476,6 +523,7 @@
 
   function useOcrValues(fields) {
     var raw = R.hriString(fields);
+    if (batchMode) { batchAdd(raw, 'OCR', { ocr: true }); toast('เพิ่มเข้ารายการรอตรวจแล้ว'); return; }
     beep();
     lastRaw = { raw: raw, format: 'OCR' };
     current = parseCode(raw, 'OCR');
@@ -489,6 +537,7 @@
     var v = $('#manualInput').value;
     if (!v.trim()) return;
     $('#manualInput').value = '';
+    if (batchMode && v.indexOf(SETUP_PREFIX) !== 0) { batchAdd(v, 'MANUAL'); return; }
     handleRaw(v, 'MANUAL');
   });
 
@@ -676,6 +725,7 @@
         putItem(r.item); putProduct(r.product);
         c.item = r.item; c.product = r.product; c.status = 'ok';
         toast('บันทึกเข้าคลังแล้ว');
+        batchRemove(c.code);
         renderResult();
         if (photo) await uploadPhoto(c.type, photo);
       } catch (err) {
@@ -904,6 +954,164 @@
     } catch (e) { var b2 = $('#histBody'); if (b2) b2.textContent = errText(e); }
     return p;
   }
+
+  /* ---------- batch: scan many, check and save later (kept on this device) ---------- */
+  var batchMode = !!store('batchMode');
+  var batch = store('batch') || [];
+  var RECOUNT_GAP = 2000; // a lot/type code must leave the view this long before it counts as another box
+
+  function setMode(m) {
+    batchMode = m === 'batch';
+    store('batchMode', batchMode);
+    document.querySelectorAll('#modeSeg button').forEach(function (b) { b.classList.toggle('on', b.dataset.scanmode === m); });
+    if (batchMode) { current = null; renderResult(); resumeCam(); }
+    renderBatch();
+  }
+  document.querySelectorAll('#modeSeg button').forEach(function (b) { b.addEventListener('click', function () { setMode(b.dataset.scanmode); }); });
+
+  function batchSave() { store('batch', batch.map(function (e) { var o = Object.assign({}, e); return o; })); renderBatch(); }
+  function batchRemove(code) {
+    var n = batch.length;
+    batch = batch.filter(function (e) { return e.code !== code; });
+    if (batch.length !== n) batchSave();
+  }
+  // -> 'new' | 'count' (another box of a lot) | 'seen' (already listed)
+  function batchAdd(raw, format, extra) {
+    var c = parseCode(raw, format);
+    var code = R.itemKey(c.type, c.serial, c.lot);
+    var now = Date.now();
+    var e = batch.filter(function (x) { return x.code === code; })[0];
+    if (e) {
+      var gone = now - e.lastSeen > RECOUNT_GAP;
+      e.lastSeen = now;
+      if (!e.serial && gone && format !== 'MANUAL' || (!e.serial && format === 'MANUAL')) { e.count++; beep(); batchSave(); flashRow(code); return 'count'; }
+      return 'seen';
+    }
+    batch.unshift({
+      code: code, type: c.type, serial: c.serial, lot: c.lot, ref: c.ref, mfg_date: c.mfg_date, exp_date: c.exp_date,
+      fields: c.fields, raw: raw, format: format, ocr: !!(extra && extra.ocr), count: 1, ts: now, lastSeen: now,
+      qty: '', unit: '', location: '', note: ''
+    });
+    beep();
+    batchSave();
+    flashRow(code);
+    return 'new';
+  }
+  function flashRow(code) {
+    var li = document.querySelector('#batchList li[data-code="' + (window.CSS && CSS.escape ? CSS.escape(code) : code) + '"]');
+    if (li) { li.classList.remove('flash'); void li.offsetWidth; li.classList.add('flash'); }
+  }
+  function rowStatus(e) { return byCode[e.code] ? 'ok' : byType[e.type] ? 'known' : 'new'; }
+  var ROW_CHIP = { ok: '<span class="badge ok">มีในคลังแล้ว</span>', known: '<span class="badge warn">ชิ้นใหม่ · รู้จักรุ่น</span>', new: '<span class="badge bad">รุ่นใหม่</span>' };
+
+  function renderBatch() {
+    var n = batch.length;
+    $('#batchCount').textContent = n; $('#batchCount').hidden = !n;
+    $('#batchPanel').hidden = !batchMode && !n;
+    if ($('#batchPanel').hidden) return;
+    $('#batchN').textContent = n ? '(' + n + ')' : '';
+    var st = { ok: 0, known: 0, new: 0 };
+    batch.forEach(function (e) { st[rowStatus(e)]++; });
+    var newTypes = {};
+    batch.forEach(function (e) { if (!byType[e.type]) newTypes[e.type] = 1; });
+    $('#batchSummary').textContent = n ? 'มีในคลังแล้ว ' + st.ok + ' · ชิ้นใหม่ ' + (st.known + st.new) + (Object.keys(newTypes).length ? ' (รุ่นใหม่ ' + Object.keys(newTypes).length + ' รุ่น ต้องตั้งชื่อตอนบันทึก)' : '')
+      : (camOn ? 'สแกนไปเรื่อยๆ ได้เลย — แต่ละโค้ดจะเข้ารายการนี้ (ไม่ซ้ำ)' : 'เปิดกล้องหรือถ่ายรูป แล้วสแกนไปเรื่อยๆ — แต่ละโค้ดจะเข้ารายการนี้');
+    $('#btnBatchSave').disabled = !n; $('#btnBatchClear').disabled = !n;
+    $('#batchList').innerHTML = batch.map(function (e) {
+      var p = byType[e.type], s = rowStatus(e);
+      var id = e.serial ? 'SN ' + e.serial : e.lot ? 'LOT ' + e.lot : e.type;
+      var extra = [e.location, e.note].filter(Boolean).join(' · ');
+      return '<li class="batch-row" data-code="' + esc(e.code) + '">' + thumb(p) +
+        '<div class="main" data-b="open"><div class="t">' + esc((p && p.name) || e.type) + '</div>' +
+        '<div class="s">' + esc(id) + (extra ? ' · ' + esc(extra) : '') + '</div>' +
+        '<div class="chips">' + ROW_CHIP[s] + (e.ocr ? '<span class="badge warn">OCR</span>' : '') + (e.exp_date ? expBadge(e.exp_date) : '') + '</div></div>' +
+        (e.serial ? '' : '<div class="qty">×' + esc(e.qty || e.count) + '</div>') +
+        '<div class="acts"><button class="btn" type="button" data-b="edit" aria-label="แก้รายชิ้น">✎</button><button class="btn" type="button" data-b="del" aria-label="เอาออก">×</button></div></li>';
+    }).join('') || '';
+  }
+
+  $('#batchList').addEventListener('click', async function (ev) {
+    var t = ev.target.closest('[data-b]'); if (!t) return;
+    var code = t.closest('li').dataset.code;
+    var e = batch.filter(function (x) { return x.code === code; })[0];
+    if (!e) return;
+    if (t.dataset.b === 'del') { batchRemove(code); return; }
+    if (t.dataset.b === 'open') {
+      // look at / register this one on its own
+      setMode('single');
+      current = parseCode(e.raw, e.format);
+      current.ocr = e.ocr;
+      resolveCurrent(false);
+      $('#result').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      return;
+    }
+    var r = await dialog('<h3>แก้รายชิ้น</h3><p class="small muted" style="margin:0">' + esc(e.serial ? 'SN ' + e.serial : e.lot ? 'LOT ' + e.lot : e.type) + '</p>' +
+      (e.serial ? '' : '<div class="grid2"><label>จำนวน<input name="qty" type="number" step="any" inputmode="decimal" value="' + esc(e.qty || e.count) + '"></label>' +
+        '<label>หน่วย<input name="unit" value="' + esc(e.unit) + '"></label></div>') +
+      '<label>ที่เก็บ (ว่าง = ใช้ค่ารวมตอนบันทึก)<input name="location" list="dlLocation" value="' + esc(e.location) + '"></label>' +
+      '<label>Note<textarea name="note" rows="2">' + esc(e.note) + '</textarea></label>', [['ยกเลิก'], ['ตกลง', 'primary', 'ok']]);
+    if (r.btn !== 'ok') return;
+    if (!e.serial) { e.qty = r.data.qty; e.unit = r.data.unit; }
+    e.location = r.data.location.trim(); e.note = r.data.note.trim();
+    batchSave();
+  });
+
+  $('#btnBatchClear').addEventListener('click', async function () {
+    if (!batch.length) return;
+    if (!(await confirmBox('ล้างรายการรอตรวจทั้งหมด ' + batch.length + ' รายการ? (ยังไม่ได้บันทึกเข้าคลัง)', 'ล้าง'))) return;
+    batch = []; batchSave();
+  });
+
+  $('#btnBatchSave').addEventListener('click', async function () {
+    var btn = this;
+    if (!batch.length) return;
+    if (!cfg.url) return toast(ERR_TH.no_config, true);
+    var groups = {};
+    batch.forEach(function (e) { if (!byType[e.type]) (groups[e.type] = groups[e.type] || []).push(e); });
+    var types = Object.keys(groups);
+    var st = { ok: 0, fresh: 0 };
+    batch.forEach(function (e) { if (rowStatus(e) === 'ok') st.ok++; else st.fresh++; });
+    var html = '<h3>บันทึก ' + batch.length + ' รายการ</h3>' +
+      '<p class="small" style="margin:0">ชิ้นใหม่ ' + st.fresh + ' → ลงทะเบียนเข้าคลัง · มีในคลังแล้ว ' + st.ok + ' → บันทึกว่าตรวจนับแล้ว</p>' +
+      '<label>ที่เก็บ (ใช้กับทุกชิ้นที่ยังไม่ได้ใส่)<input name="location" list="dlLocation" placeholder="เช่น คลังกลาง"></label>' +
+      '<label>Note (ใช้กับทุกชิ้นที่ยังไม่ได้ใส่)<textarea name="note" rows="2"></textarea></label>' +
+      types.map(function (t, i) {
+        var ref = groups[t].map(function (e) { return e.ref; }).filter(Boolean)[0] || '';
+        return '<fieldset class="card" style="box-shadow:none"><b>รุ่นใหม่ ' + esc(t) + (ref ? ' · REF ' + esc(ref) : '') + ' · ' + groups[t].length + ' ชิ้น</b>' +
+          '<label>ชื่อสินค้า *<input name="pn' + i + '" required></label>' +
+          '<div class="grid2"><label>หมวดหมู่<input name="pc' + i + '" list="dlCategory"></label><label>ยี่ห้อ / ผู้ผลิต<input name="pb' + i + '" list="dlBrand"></label></div></fieldset>';
+      }).join('') +
+      (batch.some(function (e) { return e.ocr; }) ? '<p class="small" style="margin:0"><span class="badge warn">OCR</span> บางรายการอ่านจากตัวหนังสือ — ตรวจแล้วตอนเพิ่มเข้ารายการ</p>' : '');
+    var r = await dialog(html, [['ยกเลิก'], ['บันทึกทั้งหมด', 'primary', 'ok']]);
+    if (r.btn !== 'ok') return;
+    var d = r.data;
+    var newProducts = types.map(function (t, i) {
+      return { type_code: t, name: d['pn' + i], category: d['pc' + i], brand: d['pb' + i], ref: groups[t].map(function (e) { return e.ref; }).filter(Boolean)[0] || '' };
+    });
+    var entries = batch.map(function (e) {
+      return {
+        code: e.code, type_code: e.type, serial: e.serial, lot: e.lot, ref: e.ref || (byType[e.type] && byType[e.type].ref) || '',
+        mfg_date: e.mfg_date, exp_date: e.exp_date, fields: e.fields ? JSON.stringify(e.fields) : '', format: e.ocr ? 'OCR' : e.format,
+        raw_sample: e.raw, qty: e.serial ? 1 : (e.qty || e.count), unit: e.serial ? '' : e.unit,
+        location: e.location || d.location.trim(), note: e.note || d.note.trim()
+      };
+    });
+    await busy(btn, async function () {
+      var made = 0, checked = 0, failed = 0;
+      try {
+        for (var i = 0; i < entries.length; i += 40) {
+          toast('กำลังบันทึก… ' + Math.min(i + 40, entries.length) + '/' + entries.length);
+          var res = await api('saveBatch', { products: i === 0 ? newProducts : [], entries: entries.slice(i, i + 40) });
+          (res.products || []).forEach(putProduct);
+          res.results.forEach(function (x) {
+            if (x.status === 'created' || x.status === 'exists') { if (x.item) putItem(x.item); batchRemove(x.code); }
+            if (x.status === 'created') made++; else if (x.status === 'exists') checked++; else if (x.status !== 'duplicate') failed++;
+          });
+        }
+        toast('บันทึกแล้ว: ใหม่ ' + made + ' · ตรวจนับ ' + checked + (failed ? ' · ผิดพลาด ' + failed : ''), !!failed);
+      } catch (err) { toast(errText(err) + ' — รายการที่ยังไม่บันทึกยังอยู่ในรายการ', true); }
+    });
+  });
 
   /* ---------- stock list ---------- */
   function fillDatalists() {
@@ -1184,6 +1392,8 @@
   /* ---------- boot ---------- */
   try { localStorage.removeItem('qrs.items'); localStorage.removeItem('qrs.rules'); } catch (e) { /* v1.0 leftovers */ }
   reindex();
+  window.__qrsBatchReady = true;
+  setMode(batchMode ? 'batch' : 'single');
   fillSettings();
   fillDatalists();
   renderStock();

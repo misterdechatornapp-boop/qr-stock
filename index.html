@@ -21,8 +21,13 @@
 <main>
   <!-- ============ SCAN ============ -->
   <section class="view" id="view-scan">
+    <div class="seg" id="modeSeg" role="tablist">
+      <button type="button" data-scanmode="single" role="tab">ทีละชิ้น</button>
+      <button type="button" data-scanmode="batch" role="tab">หลายชิ้น <span class="count-pill" id="batchCount" hidden></span></button>
+    </div>
     <div class="scanner-wrap">
       <div id="reader"><video id="camVideo" playsinline muted autoplay></video></div>
+      <canvas id="camOverlay" aria-hidden="true"></canvas>
       <div class="guide" id="camGuide" hidden></div>
       <div class="cam-hint" id="camHint" hidden>
         <span>ยังหาโค้ดไม่เจอ · ถอยออก ~20 ซม. แล้วซูม 2× · เอียงหลบแสงสะท้อน</span>
@@ -52,6 +57,16 @@
       <input id="manualInput" placeholder="พิมพ์ / ยิงเครื่องสแกน แล้วกด Enter" enterkeyhint="search">
       <button class="btn" type="submit">ตรวจ</button>
     </form>
+
+    <section class="card" id="batchPanel" hidden>
+      <div class="toolbar">
+        <h2 class="grow">รายการรอตรวจ <span id="batchN" class="muted"></span></h2>
+        <button class="btn small" id="btnBatchClear" type="button">ล้าง</button>
+        <button class="btn small primary" id="btnBatchSave" type="button">บันทึกทั้งหมด</button>
+      </div>
+      <p class="small muted" id="batchSummary" style="margin:0"></p>
+      <ul class="list" id="batchList"></ul>
+    </section>
 
     <div id="result"></div>
   </section>

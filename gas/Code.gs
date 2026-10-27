@@ -7,7 +7,7 @@
  *   Products — one row per product type (key: type_code = GTIN for GS1 codes)
  *   Items    — one row per stock unit (key: code = type|SN:serial, type|LOT:lot, or type)
  */
-var VERSION = '1.4.0';
+var VERSION = '1.5.0';
 
 var SHEETS = {
   Products: ['type_code', 'ref', 'name', 'category', 'brand', 'note', 'image_id', 'thumb', 'created_at', 'updated_at'],
@@ -53,6 +53,7 @@ function doPost(e) {
       case 'list': return json_({ ok: true, items: read_('Items').rows, products: read_('Products').rows });
       case 'scan': return json_(withLock_(function () { return scan_(req); }));
       case 'saveItem': return json_(withLock_(function () { return saveItem_(req); }));
+      case 'saveBatch': return json_(withLock_(function () { return saveBatch_(req); }));
       case 'saveProduct': return json_(withLock_(function () { return { ok: true, product: upsertProduct_(req.product || {}, req.device) }; }));
       case 'removeItem': return json_(withLock_(function () { return removeItem_(req); }));
       case 'removeProduct': return json_(withLock_(function () { return removeProduct_(req); }));
@@ -143,6 +144,46 @@ function upsertProduct_(pr, device) {
   writeRow_('Products', idx, rec);
   log_(idx !== undefined ? 'product_update' : 'product_create', type, '', (idx !== undefined ? 'แก้ไขประเภท ' : 'สร้างประเภท ') + (rec.name || ''), device);
   return serialize_(rec);
+}
+
+// many scanned rows in one request: new rows are appended together, rows already in stock are counted as checked
+// req: {products: [product…] (new types only), entries: [item…]}
+function saveBatch_(req) {
+  var now = new Date();
+  var products = (req.products || []).map(function (p) { return upsertProduct_(p, req.device); });
+  var data = read_('Items');
+  var c = colMap_('Items');
+  var newRows = [], logs = [], results = [], seen = {};
+  (req.entries || []).forEach(function (it) {
+    var code = clean_(it.code), type = clean_(it.type_code);
+    if (!code || !type) { results.push({ code: code, status: 'error', error: 'empty_code' }); return; }
+    if (seen[code]) { results.push({ code: code, status: 'duplicate' }); return; }
+    seen[code] = true;
+    var idx = data.index[code];
+    if (idx !== undefined) {
+      var row = data.rows[idx];
+      var count = Number(row.scan_count || 0) + 1;
+      data.sheet.getRange(idx + 2, c.scan_count + 1, 1, 2).setValues([[count, now]]);
+      row.scan_count = count; row.last_scan = now.toISOString();
+      logs.push([now, 'scan', code, String(it.raw_sample || '').slice(0, 2000), 'ตรวจนับ (สแกนหลายชิ้น)', String(req.device || '').slice(0, 60)]);
+      results.push({ code: code, status: 'exists', item: row });
+      return;
+    }
+    var rec = {};
+    SHEETS.Items.forEach(function (k) { rec[k] = it[k] !== undefined && it[k] !== null ? it[k] : ''; });
+    rec.code = code; rec.type_code = type;
+    rec.qty = rec.qty === '' ? '' : Number(rec.qty);
+    if (typeof rec.fields === 'object') rec.fields = JSON.stringify(rec.fields);
+    rec.created_at = now; rec.updated_at = now; rec.scan_count = 0; rec.last_scan = '';
+    newRows.push(SHEETS.Items.map(function (k) { return rec[k]; }));
+    var detail = 'ลงทะเบียนใหม่ (สแกนหลายชิ้น)' + (it.note ? ' · note: ' + String(it.note).slice(0, 200) : '') +
+      (it.format === 'OCR' ? ' · ค่าจากการอ่านตัวหนังสือบนฉลาก (OCR) ผู้ใช้ยืนยันแล้ว' : '');
+    logs.push([now, 'create', code, String(it.raw_sample || '').slice(0, 2000), detail, String(req.device || '').slice(0, 60)]);
+    results.push({ code: code, status: 'created', item: serialize_(rec) });
+  });
+  appendRows_('Items', newRows);
+  appendRows_('Log', logs);
+  return { ok: true, results: results, products: products };
 }
 
 function removeItem_(req) {

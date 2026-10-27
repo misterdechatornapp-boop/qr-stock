@@ -137,6 +137,14 @@ label.check input { width: 20px; min-height: 20px; height: 20px; accent-color: v
   outline: 2px solid rgba(255,255,255,.85); outline-offset: -2px;
 }
 .guide.hit { outline-color: #2dd4bf; outline-width: 4px; }
+#camOverlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.count-pill { display: inline-block; min-width: 20px; padding: 0 6px; margin-left: 4px; border-radius: 99px; background: var(--brand); color: var(--brand-ink); font-size: 12px; line-height: 20px; }
+.batch-row .main { cursor: pointer; }
+.batch-row .chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+.batch-row .acts { display: flex; gap: 4px; }
+.batch-row .acts .btn { width: 36px; min-height: 36px; padding: 0; }
+.batch-row.flash { animation: flash .9s ease; }
+@keyframes flash { from { background: var(--brand-soft); } to { background: var(--surface); } }
 .cam-ctrl {
   position: absolute; left: 10px; right: 10px; bottom: 10px; display: flex; align-items: center; gap: 10px;
   padding: 6px 10px; border-radius: 99px; background: rgba(0,0,0,.5); color: #fff; backdrop-filter: blur(6px);
