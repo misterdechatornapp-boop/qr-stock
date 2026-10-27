@@ -61,6 +61,7 @@
     <section class="card" id="batchPanel" hidden>
       <div class="toolbar">
         <h2 class="grow">รายการรอตรวจ <span id="batchN" class="muted"></span></h2>
+        <button class="btn small" id="btnBatchGroup" type="button">👥 ใส่กลุ่ม</button>
         <button class="btn small" id="btnBatchClear" type="button">ล้าง</button>
         <button class="btn small primary" id="btnBatchSave" type="button">บันทึกทั้งหมด</button>
       </div>
@@ -73,19 +74,25 @@
 
   <!-- ============ STOCK ============ -->
   <section class="view" id="view-stock" hidden>
-    <div class="seg" role="tablist">
-      <button type="button" data-mode="items" class="on" role="tab">รายเครื่อง / ล็อต</button>
+    <div class="summary" id="stockSummary"></div>
+    <div class="seg seg3" id="stockSeg" role="tablist">
+      <button type="button" data-mode="items" role="tab">รายเครื่อง / ล็อต</button>
       <button type="button" data-mode="products" role="tab">ประเภทสินค้า</button>
+      <button type="button" data-mode="groups" role="tab">กลุ่ม</button>
     </div>
     <div class="toolbar">
-      <input type="search" id="stockSearch" placeholder="ค้นหา ชื่อ GTIN REF Serial Lot note">
+      <input type="search" id="stockSearch" placeholder="ค้นหา ชื่อ GTIN REF SN Lot ที่เก็บ note">
       <button class="btn icon" id="btnRefresh" type="button" title="โหลดใหม่" aria-label="โหลดใหม่">⟳</button>
     </div>
     <div class="toolbar sub">
-      <select id="catFilter" aria-label="หมวดหมู่" style="width:auto;flex:1;min-width:0"></select>
-      <button class="btn small" id="btnAddManual" type="button">+ เพิ่มเอง</button>
+      <button class="btn small" id="btnFilter" type="button">ตัวกรอง <span class="count-pill" id="filterCount" hidden></span></button>
+      <select id="sortSel" aria-label="เรียงลำดับ" class="sort-sel"></select>
+      <button class="btn small" id="btnSelect" type="button">เลือก</button>
+      <button class="btn small primary" id="btnNewGroup" type="button">+ สร้างกลุ่ม</button>
+      <button class="btn small" id="btnAddManual" type="button" title="เพิ่มรายการเอง">+</button>
       <button class="btn small" id="btnExport" type="button">CSV</button>
     </div>
+    <div class="fchips" id="activeFilters"></div>
     <p id="stockCount" class="muted small" style="margin:0"></p>
     <ul class="list" id="stockList"></ul>
   </section>
@@ -140,6 +147,22 @@
 <datalist id="dlCategory"></datalist>
 <datalist id="dlBrand"></datalist>
 <datalist id="dlLocation"></datalist>
+<datalist id="dlPlace"></datalist>
+<div class="selbar" id="selBar" hidden>
+  <div class="selbar-top">
+    <b id="selN">เลือก 0 รายการ</b>
+    <button class="btn small" id="btnSelAll" type="button">เลือก/ไม่เลือกทั้งหมด</button>
+    <span class="grow"></span>
+    <button class="btn small" id="btnSelDone" type="button">เสร็จ</button>
+  </div>
+  <div class="selbar-acts">
+    <button class="btn small" type="button" data-sa="group">👥 เข้ากลุ่ม</button>
+    <button class="btn small" type="button" data-sa="edit">✎ แก้ไข</button>
+    <button class="btn small" type="button" data-sa="copy">📋 คัดลอก</button>
+    <button class="btn small" type="button" data-sa="csv">CSV</button>
+    <button class="btn small danger" type="button" data-sa="del">ลบ</button>
+  </div>
+</div>
 <dialog id="dlg"><form method="dialog" id="dlgForm"></form></dialog>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 

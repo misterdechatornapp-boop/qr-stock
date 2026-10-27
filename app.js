@@ -1,7 +1,7 @@
 /* QR Stock — UI */
 (function () {
   'use strict';
-  var APP_VERSION = '1.5.0';
+  var APP_VERSION = '1.6.0';
   var SETUP_PREFIX = 'QRSTOCK-SETUP:';
   var R = window.QRRules;
 
@@ -57,7 +57,9 @@
   var rulesDirty = false;
   var lastRaw = null;
   var current = null; // scan context, see parseCode()
-  var stockMode = 'items';
+  var stockMode = store('stockMode') || 'items';
+  var groups = store('groups') || [];
+  var members = store('members') || []; // [{group_id, code}]
   var byCode = {}, byType = {};
 
   function reindex() {
@@ -65,7 +67,13 @@
     items.forEach(function (it) { byCode[it.code] = it; });
     products.forEach(function (p) { byType[p.type_code] = p; });
   }
-  function saveLocal() { reindex(); store('items2', items); store('products', products); renderStock(); fillDatalists(); if (window.__qrsBatchReady) renderBatch(); }
+  function saveLocal() {
+    reindex(); store('items2', items); store('products', products); store('groups', groups); store('members', members);
+    renderStock(); fillDatalists(); if (window.__qrsBatchReady) renderBatch();
+  }
+  function groupsOf(code) { var ids = members.filter(function (m) { return m.code === code; }).map(function (m) { return m.group_id; }); return groups.filter(function (g) { return ids.indexOf(g.group_id) >= 0; }); }
+  function membersOf(gid) { return members.filter(function (m) { return m.group_id === gid; }).map(function (m) { return byCode[m.code]; }).filter(Boolean); }
+  function addMembers(list) { (list || []).forEach(function (m) { if (!members.some(function (x) { return x.group_id === m.group_id && x.code === m.code; })) members.push({ group_id: m.group_id, code: m.code }); }); }
   function putItem(it) {
     if (!it) return;
     var i = items.findIndex(function (x) { return x.code === it.code; });
@@ -129,6 +137,8 @@
       var r = await Promise.all([api('list'), api('getRules')]);
       items = r[0].items || [];
       products = r[0].products || [];
+      groups = r[0].groups || [];
+      members = (r[0].members || []).map(function (m) { return { group_id: m.group_id, code: m.code }; });
       saveLocal();
       lastSync = Date.now(); store('lastSync', lastSync);
       var srvRules = r[1].rules ? JSON.parse(r[1].rules) : null;
@@ -822,7 +832,7 @@
   }
 
   /* ---------- generic dialog (no native prompt/confirm) ---------- */
-  function dialog(html, buttons) {
+  function dialog(html, buttons, onOpen) {
     var dlg = $('#dlg'), form = $('#dlgForm');
     form.innerHTML = html + '<div class="row-end">' + buttons.map(function (b) {
       return '<button class="btn ' + (b[1] || '') + '" value="' + (b[2] || 'cancel') + '"' + (b[2] && b[2] !== 'del' ? '' : ' formnovalidate') + '>' + esc(b[0]) + '</button>';
@@ -833,7 +843,10 @@
         form.removeEventListener('submit', onSubmit);
         dlg.removeEventListener('close', onClose);
         var data = {};
-        form.querySelectorAll('[name]').forEach(function (i) { data[i.name] = i.type === 'checkbox' ? i.checked : i.type === 'file' ? i.files[0] : i.value; });
+        form.querySelectorAll('[name]').forEach(function (i) {
+          if (i.type === 'checkbox' && i.value !== 'on') { data[i.name] = data[i.name] || []; if (i.checked) data[i.name].push(i.value); return; }
+          data[i.name] = i.type === 'checkbox' ? i.checked : i.type === 'file' ? i.files[0] : i.value;
+        });
         if (dlg.open) dlg.close(btn);
         resolve({ btn: btn, data: data });
       }
@@ -842,6 +855,7 @@
       form.addEventListener('submit', onSubmit);
       dlg.addEventListener('close', onClose);
       dlg.showModal();
+      if (onOpen) onOpen(form);
       var first = form.querySelector('input,textarea,select');
       if (first && window.matchMedia('(pointer:fine)').matches) first.focus();
     });
@@ -866,9 +880,11 @@
       (kind !== 'serial' ? '<div class="grid2"><label>จำนวน<input name="qty" type="number" step="any" inputmode="decimal" value="' + esc(it.qty) + '"></label>' +
         '<label>หน่วย<input name="unit" value="' + esc(it.unit) + '"></label></div>' : '') +
       '<label>ที่เก็บ<input name="location" list="dlLocation" value="' + esc(it.location) + '"></label>' +
-      '<label>Note<textarea name="note" rows="4">' + esc(it.note) + '</textarea></label>';
-    var r = await dialog(html, [['ลบ', 'danger', 'del'], ['ประวัติ', '', 'hist'], ['ยกเลิก'], ['บันทึก', 'primary', 'save']]);
+      '<label>Note<textarea name="note" rows="4">' + esc(it.note) + '</textarea></label>' +
+      (groupsOf(it.code).length ? '<div class="small">กลุ่ม: ' + groupsOf(it.code).map(function (g) { return '<span class="chip">' + esc(g.name) + '</span>'; }).join(' ') + '</div>' : '');
+    var r = await dialog(html, [['ลบ', 'danger', 'del'], ['ประวัติ', '', 'hist'], ['คัดลอก', '', 'copy'], ['ยกเลิก'], ['บันทึก', 'primary', 'save']]);
     if (r.btn === 'hist') return openHistory(it.code);
+    if (r.btn === 'copy') return copyText(itemLine(it, true));
     if (r.btn === 'del') {
       if (await confirmBox('ลบ ' + (it.serial ? 'SN ' + it.serial : it.lot ? 'ล็อต ' + it.lot : it.code) + ' ออกจากคลัง? (ประวัติยังอยู่ใน Sheet)', 'ลบ')) {
         try {
@@ -1017,6 +1033,10 @@
     $('#batchSummary').textContent = n ? 'มีในคลังแล้ว ' + st.ok + ' · ชิ้นใหม่ ' + (st.known + st.new) + (Object.keys(newTypes).length ? ' (รุ่นใหม่ ' + Object.keys(newTypes).length + ' รุ่น ต้องตั้งชื่อตอนบันทึก)' : '')
       : (camOn ? 'สแกนไปเรื่อยๆ ได้เลย — แต่ละโค้ดจะเข้ารายการนี้ (ไม่ซ้ำ)' : 'เปิดกล้องหรือถ่ายรูป แล้วสแกนไปเรื่อยๆ — แต่ละโค้ดจะเข้ารายการนี้');
     $('#btnBatchSave').disabled = !n; $('#btnBatchClear').disabled = !n;
+    var tg = batchGroup && groups.filter(function (g) { return g.group_id === batchGroup; })[0];
+    if (batchGroup && !tg) batchGroup = '';
+    $('#btnBatchGroup').innerHTML = tg ? '👥 ' + esc(tg.name) : '👥 ใส่กลุ่ม';
+    $('#btnBatchGroup').classList.toggle('primary', !!tg);
     $('#batchList').innerHTML = batch.map(function (e) {
       var p = byType[e.type], s = rowStatus(e);
       var id = e.serial ? 'SN ' + e.serial : e.lot ? 'LOT ' + e.lot : e.type;
@@ -1062,13 +1082,24 @@
     batch = []; batchSave();
   });
 
+  var batchGroup = store('batchGroup') || '';
+  function setBatchGroup(id) { batchGroup = id || ''; store('batchGroup', batchGroup); renderBatch(); }
+  $('#btnBatchGroup').addEventListener('click', async function () {
+    var r = await chooseGroup('ใส่ทุกรายการที่บันทึกเข้ากลุ่ม', batchGroup, true);
+    if (!r) return;
+    if (r.clear) return setBatchGroup('');
+    if (r.group_id) return setBatchGroup(r.group_id);
+    try { var g = await createGroup(r.newGroup); setBatchGroup(g.group_id); toast('สร้างกลุ่ม "' + g.name + '" แล้ว — กดบันทึกทั้งหมดเพื่อใส่รายการ'); }
+    catch (e) { toast(errText(e), true); }
+  });
+
   $('#btnBatchSave').addEventListener('click', async function () {
     var btn = this;
     if (!batch.length) return;
     if (!cfg.url) return toast(ERR_TH.no_config, true);
-    var groups = {};
-    batch.forEach(function (e) { if (!byType[e.type]) (groups[e.type] = groups[e.type] || []).push(e); });
-    var types = Object.keys(groups);
+    var newTypes = {};
+    batch.forEach(function (e) { if (!byType[e.type]) (newTypes[e.type] = newTypes[e.type] || []).push(e); });
+    var types = Object.keys(newTypes);
     var st = { ok: 0, fresh: 0 };
     batch.forEach(function (e) { if (rowStatus(e) === 'ok') st.ok++; else st.fresh++; });
     var html = '<h3>บันทึก ' + batch.length + ' รายการ</h3>' +
@@ -1076,17 +1107,18 @@
       '<label>ที่เก็บ (ใช้กับทุกชิ้นที่ยังไม่ได้ใส่)<input name="location" list="dlLocation" placeholder="เช่น คลังกลาง"></label>' +
       '<label>Note (ใช้กับทุกชิ้นที่ยังไม่ได้ใส่)<textarea name="note" rows="2"></textarea></label>' +
       types.map(function (t, i) {
-        var ref = groups[t].map(function (e) { return e.ref; }).filter(Boolean)[0] || '';
-        return '<fieldset class="card" style="box-shadow:none"><b>รุ่นใหม่ ' + esc(t) + (ref ? ' · REF ' + esc(ref) : '') + ' · ' + groups[t].length + ' ชิ้น</b>' +
+        var ref = newTypes[t].map(function (e) { return e.ref; }).filter(Boolean)[0] || '';
+        return '<fieldset class="card" style="box-shadow:none"><b>รุ่นใหม่ ' + esc(t) + (ref ? ' · REF ' + esc(ref) : '') + ' · ' + newTypes[t].length + ' ชิ้น</b>' +
           '<label>ชื่อสินค้า *<input name="pn' + i + '" required></label>' +
           '<div class="grid2"><label>หมวดหมู่<input name="pc' + i + '" list="dlCategory"></label><label>ยี่ห้อ / ผู้ผลิต<input name="pb' + i + '" list="dlBrand"></label></div></fieldset>';
       }).join('') +
-      (batch.some(function (e) { return e.ocr; }) ? '<p class="small" style="margin:0"><span class="badge warn">OCR</span> บางรายการอ่านจากตัวหนังสือ — ตรวจแล้วตอนเพิ่มเข้ารายการ</p>' : '');
-    var r = await dialog(html, [['ยกเลิก'], ['บันทึกทั้งหมด', 'primary', 'ok']]);
+      (batch.some(function (e) { return e.ocr; }) ? '<p class="small" style="margin:0"><span class="badge warn">OCR</span> บางรายการอ่านจากตัวหนังสือ — ตรวจแล้วตอนเพิ่มเข้ารายการ</p>' : '') +
+      groupPickerHtml(batchGroup, 'ใส่ทุกรายการเข้ากลุ่ม');
+    var r = await dialog(html, [['ยกเลิก'], ['บันทึกทั้งหมด', 'primary', 'ok']], wireGroupPicker);
     if (r.btn !== 'ok') return;
     var d = r.data;
     var newProducts = types.map(function (t, i) {
-      return { type_code: t, name: d['pn' + i], category: d['pc' + i], brand: d['pb' + i], ref: groups[t].map(function (e) { return e.ref; }).filter(Boolean)[0] || '' };
+      return { type_code: t, name: d['pn' + i], category: d['pc' + i], brand: d['pb' + i], ref: newTypes[t].map(function (e) { return e.ref; }).filter(Boolean)[0] || '' };
     });
     var entries = batch.map(function (e) {
       return {
@@ -1097,97 +1129,520 @@
       };
     });
     await busy(btn, async function () {
-      var made = 0, checked = 0, failed = 0;
+      var made = 0, checked = 0, failed = 0, gid = '';
       try {
+        gid = await groupFromPicker(d);
         for (var i = 0; i < entries.length; i += 40) {
           toast('กำลังบันทึก… ' + Math.min(i + 40, entries.length) + '/' + entries.length);
-          var res = await api('saveBatch', { products: i === 0 ? newProducts : [], entries: entries.slice(i, i + 40) });
+          var res = await api('saveBatch', { products: i === 0 ? newProducts : [], entries: entries.slice(i, i + 40), group_id: gid });
           (res.products || []).forEach(putProduct);
+          addMembers(res.members);
           res.results.forEach(function (x) {
             if (x.status === 'created' || x.status === 'exists') { if (x.item) putItem(x.item); batchRemove(x.code); }
             if (x.status === 'created') made++; else if (x.status === 'exists') checked++; else if (x.status !== 'duplicate') failed++;
           });
         }
-        toast('บันทึกแล้ว: ใหม่ ' + made + ' · ตรวจนับ ' + checked + (failed ? ' · ผิดพลาด ' + failed : ''), !!failed);
+        if (gid) setBatchGroup('');
+        saveLocal();
+        var gname = gid ? (groups.filter(function (g) { return g.group_id === gid; })[0] || {}).name : '';
+        toast('บันทึกแล้ว: ใหม่ ' + made + ' · ตรวจนับ ' + checked + (gname ? ' · เข้ากลุ่ม "' + gname + '"' : '') + (failed ? ' · ผิดพลาด ' + failed : ''), !!failed);
       } catch (err) { toast(errText(err) + ' — รายการที่ยังไม่บันทึกยังอยู่ในรายการ', true); }
     });
   });
 
-  /* ---------- stock list ---------- */
+  /* ---------- stock: filters, sort, multi-select, groups, copy ---------- */
   function fillDatalists() {
     var uniq = function (arr) { return arr.filter(function (v, i) { return v && arr.indexOf(v) === i; }).sort(); };
     var opt = function (v) { return '<option value="' + esc(v) + '">'; };
-    var cats = uniq(products.map(function (p) { return p.category; }));
-    $('#dlCategory').innerHTML = cats.map(opt).join('');
+    $('#dlCategory').innerHTML = uniq(products.map(function (p) { return p.category; })).map(opt).join('');
     $('#dlBrand').innerHTML = uniq(products.map(function (p) { return p.brand; })).map(opt).join('');
     $('#dlLocation').innerHTML = uniq(items.map(function (i) { return i.location; })).map(opt).join('');
-    var sel = $('#catFilter'), v = sel.value;
-    sel.innerHTML = '<option value="">ทุกหมวดหมู่</option>' + cats.map(function (c) { return '<option' + (c === v ? ' selected' : '') + '>' + esc(c) + '</option>'; }).join('');
+    $('#dlPlace').innerHTML = uniq(groups.map(function (g) { return g.place; })).map(opt).join('');
   }
 
-  function renderStock() {
-    var q = ($('#stockSearch').value || '').trim().toLowerCase();
-    var cat = $('#catFilter').value;
-    var hit = function (arr) { return !q || arr.join(' ').toLowerCase().indexOf(q) >= 0; };
-    var list, html;
-    if (stockMode === 'products') {
-      list = products.filter(function (p) { return (!cat || p.category === cat) && hit([p.type_code, p.name, p.ref, p.category, p.brand, p.note]); })
-        .sort(function (a, b) { return String(a.name).localeCompare(String(b.name), 'th'); });
-      html = list.map(function (p) {
-        var n = unitsOf(p.type_code).length;
-        return '<li class="tap" data-type="' + esc(p.type_code) + '">' + thumb(p) + '<div class="main"><div class="t">' + esc(p.name || '(ไม่มีชื่อ)') + '</div>' +
-          '<div class="s">' + esc([p.ref, p.category, p.brand].filter(Boolean).join(' · ') || p.type_code) + '</div></div>' +
-          '<div class="qty">' + (n ? totalOf(p.type_code) : '<span class="muted small">ไม่มีของ</span>') + '</div></li>';
-      }).join('');
-      $('#stockCount').textContent = 'ประเภทสินค้า ' + products.length + ' รายการ' + (q || cat ? ' · พบ ' + list.length : '');
-    } else {
-      list = items.filter(function (it) {
-        var p = byType[it.type_code] || {};
-        return (!cat || p.category === cat) && hit([it.code, it.serial, it.lot, it.ref, it.location, it.note, p.name, p.category, p.brand]);
-      }).sort(function (a, b) { return String(b.updated_at).localeCompare(String(a.updated_at)); });
-      html = list.map(function (it) {
-        var p = byType[it.type_code];
-        var id = it.serial ? 'SN ' + it.serial : it.lot ? 'LOT ' + it.lot : it.type_code;
-        return '<li class="tap" data-code="' + esc(it.code) + '">' + thumb(p) + '<div class="main"><div class="t">' + esc((p && p.name) || it.type_code) + '</div>' +
-          '<div class="s">' + esc([id, it.location, it.note].filter(Boolean).join(' · ')) + '</div>' + (it.exp_date ? '<div>' + expBadge(it.exp_date) + '</div>' : '') + '</div>' +
-          (it.serial ? '' : '<div class="qty">' + esc(it.qty) + ' ' + esc(it.unit || '') + '</div>') + '</li>';
-      }).join('');
-      $('#stockCount').textContent = 'ในคลัง ' + items.length + ' รายการ' + (q || cat ? ' · พบ ' + list.length : '');
+  /* text for LINE / email: "1. Battery Pack EU5094 SN 12756806M001" */
+  function itemId(it) { return it.serial ? 'SN ' + it.serial : it.lot ? 'LOT ' + it.lot : it.type_code; }
+  function itemName(it) { var p = byType[it.type_code]; return (p && p.name) || it.type_code; }
+  function itemLine(it, detailed) {
+    var name = itemName(it), ref = it.ref || (byType[it.type_code] || {}).ref || '';
+    var parts = [name];
+    if (ref && name.indexOf(ref) < 0) parts.push(ref);
+    parts.push(itemId(it));
+    if (!it.serial && it.qty !== '' && it.qty != null) parts.push('× ' + it.qty + (it.unit ? ' ' + it.unit : ''));
+    var line = parts.join(' ');
+    if (detailed) {
+      var more = [];
+      if (it.mfg_date) more.push('ผลิต ' + fmtDay(it.mfg_date));
+      if (it.exp_date) more.push('หมดอายุ ' + fmtDay(it.exp_date));
+      if (it.location) more.push(it.location);
+      if (it.note) more.push(it.note.replace(/\s*\n\s*/g, ' / '));
+      if (more.length) line += ' · ' + more.join(' · ');
     }
-    var empty = (stockMode === 'products' ? products : items).length ? 'ไม่พบรายการที่ค้นหา' : 'ยังไม่มีข้อมูล — ไปสแกนเพื่อลงทะเบียน';
-    $('#stockList').innerHTML = html || '<li class="empty">' + empty + '</li>';
+    return line;
   }
-  $('#stockSearch').addEventListener('input', renderStock);
-  $('#catFilter').addEventListener('change', renderStock);
-  document.querySelectorAll('.seg button').forEach(function (b) {
-    b.addEventListener('click', function () {
-      stockMode = b.dataset.mode;
-      document.querySelectorAll('.seg button').forEach(function (x) { x.classList.toggle('on', x === b); });
-      renderStock();
-    });
-  });
-  $('#stockList').addEventListener('click', function (e) {
-    var li = e.target.closest('li.tap');
-    if (!li) return;
-    if (li.dataset.type) openProduct(byType[li.dataset.type]);
-    else openItem(byCode[li.dataset.code]);
-  });
-  $('#btnRefresh').addEventListener('click', function () { var b = this; busy(b, function () { return syncAll(false); }); });
-  $('#btnAddManual').addEventListener('click', function () { recode(true); });
-  $('#btnExport').addEventListener('click', function () {
-    var cols = ['type_code', 'name', 'category', 'brand', 'ref', 'serial', 'lot', 'mfg_date', 'exp_date', 'qty', 'unit', 'location', 'note', 'created_at', 'updated_at', 'scan_count', 'last_scan'];
+  function listText(list, g) {
+    var head = g ? g.name + (g.place ? ' → ' + g.place : '') + (g.date ? ' · ' + fmtDay(g.date) : '') + '\n' : '';
+    return head + list.map(function (it, i) { return (i + 1) + '. ' + itemLine(it); }).join('\n') + '\nรวม ' + list.length + ' รายการ';
+  }
+  async function copyText(text) {
+    try { await navigator.clipboard.writeText(text); toast('คัดลอกแล้ว'); return; } catch (e) { /* fall back to a selectable box */ }
+    await dialog('<h3>คัดลอกข้อความ</h3><p class="small muted" style="margin:0">กดค้างในกล่องแล้วเลือก "คัดลอก"</p><textarea id="copyBox" rows="10" readonly>' + esc(text) + '</textarea>',
+      [['ปิด']], function () { var t = $('#copyBox'); t.focus(); t.select(); });
+  }
+  function exportCsv(list, name) {
+    var cols = ['type_code', 'name', 'category', 'brand', 'ref', 'serial', 'lot', 'mfg_date', 'exp_date', 'qty', 'unit', 'location', 'note', 'groups', 'created_at', 'updated_at', 'scan_count', 'last_scan'];
     var cell = function (v) { v = v == null ? '' : String(v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
-    var csv = '\ufeff' + cols.join(',') + '\n' + items.map(function (it) {
+    var csv = '﻿' + cols.join(',') + '\n' + list.map(function (it) {
       var p = byType[it.type_code] || {};
-      var row = Object.assign({}, it, { name: p.name, category: p.category, brand: p.brand, ref: it.ref || p.ref });
+      var row = Object.assign({}, it, { name: p.name, category: p.category, brand: p.brand, ref: it.ref || p.ref, groups: groupsOf(it.code).map(function (g) { return g.name; }).join(' | ') });
       return cols.map(function (k) { return cell(row[k]); }).join(',');
     }).join('\n');
     var a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
-    a.download = 'qr-stock-' + new Date().toISOString().slice(0, 10) + '.csv';
+    a.download = (name || 'qr-stock') + '-' + new Date().toISOString().slice(0, 10) + '.csv';
     a.click();
     setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000);
+  }
+
+  /* dates */
+  function daysTo(v) {
+    var m = String(v || '').match(/^(\d{4})-(\d{2})(?:-(\d{2}))?$/);
+    if (!m) return null;
+    var end = m[3] ? new Date(+m[1], +m[2] - 1, +m[3]) : new Date(+m[1], +m[2], 0);
+    return Math.floor((end - new Date().setHours(0, 0, 0, 0)) / 864e5);
+  }
+  function dueBadge(date) {
+    var d = daysTo(date);
+    if (d === null) return '';
+    if (d < 0) return '<span class="badge bad">เลยกำหนด ' + (-d) + ' วัน</span>';
+    if (d === 0) return '<span class="badge warn">วันนี้</span>';
+    if (d <= 3) return '<span class="badge warn">อีก ' + d + ' วัน</span>';
+    return '<span class="badge ok">' + fmtDay(date) + '</span>';
+  }
+
+  /* filters + sort (remembered per device) */
+  var filt = store('filt') || {};
+  var SORTS = {
+    items: {
+      updated: ['แก้ไขล่าสุด', function (a, b) { return cmpDesc(a.updated_at, b.updated_at); }],
+      created: ['ลงทะเบียนล่าสุด', function (a, b) { return cmpDesc(a.created_at, b.created_at); }],
+      name: ['ชื่อ ก→ฮ / A→Z', function (a, b) { return itemName(a).localeCompare(itemName(b), 'th') || nat(itemId(a), itemId(b)); }],
+      sn: ['SN / Lot', function (a, b) { return nat(itemId(a), itemId(b)); }],
+      mfg_desc: ['วันผลิต ใหม่→เก่า', function (a, b) { return cmpDesc(a.mfg_date, b.mfg_date); }],
+      mfg_asc: ['วันผลิต เก่า→ใหม่', function (a, b) { return cmpAsc(a.mfg_date, b.mfg_date); }],
+      exp: ['หมดอายุก่อน', function (a, b) { return cmpAsc(a.exp_date, b.exp_date); }],
+      scan: ['สแกนล่าสุด', function (a, b) { return cmpDesc(a.last_scan, b.last_scan); }],
+      location: ['ที่เก็บ', function (a, b) { return cmpAsc(a.location, b.location) || nat(itemId(a), itemId(b)); }]
+    },
+    products: {
+      name: ['ชื่อ ก→ฮ / A→Z', function (a, b) { return String(a.name).localeCompare(String(b.name), 'th'); }],
+      count: ['จำนวนมาก→น้อย', function (a, b) { return unitsOf(b.type_code).length - unitsOf(a.type_code).length; }],
+      category: ['หมวดหมู่', function (a, b) { return cmpAsc(a.category, b.category) || String(a.name).localeCompare(String(b.name), 'th'); }]
+    },
+    groups: {
+      date: ['วันที่ใกล้สุด', function (a, b) { return cmpAsc(a.date, b.date) || String(a.name).localeCompare(String(b.name), 'th'); }],
+      updated: ['แก้ไขล่าสุด', function (a, b) { return cmpDesc(a.updated_at, b.updated_at); }],
+      name: ['ชื่อ', function (a, b) { return String(a.name).localeCompare(String(b.name), 'th'); }]
+    }
+  };
+  var sortBy = store('sortBy') || { items: 'updated', products: 'name', groups: 'date' };
+  // empty values always sink to the bottom
+  function cmpAsc(a, b) { a = a || ''; b = b || ''; if (!a !== !b) return a ? -1 : 1; return String(a).localeCompare(String(b), 'th', { numeric: true }); }
+  function cmpDesc(a, b) { a = a || ''; b = b || ''; if (!a !== !b) return a ? -1 : 1; return String(b).localeCompare(String(a), 'th', { numeric: true }); }
+  function nat(a, b) { return String(a).localeCompare(String(b), 'en', { numeric: true }); }
+
+  var FILTER_TH = { category: 'หมวดหมู่', type: 'รุ่น', location: 'ที่เก็บ', group: 'กลุ่ม', kind: 'ชนิด', exp: 'วันหมดอายุ' };
+  var KIND_OPT = { serial: 'รายเครื่อง (SN)', lot: 'ตามล็อต', type: 'ตามประเภท' };
+  var EXP_OPT = { soon: 'ใกล้หมดอายุ (≤ 90 วัน)', expired: 'หมดอายุแล้ว', none: 'ไม่มีวันหมดอายุ' };
+  function filterLabel(k, v) {
+    if (k === 'type') return (byType[v] || {}).name || v;
+    if (k === 'group') return (groups.filter(function (g) { return g.group_id === v; })[0] || {}).name || v;
+    if (k === 'kind') return KIND_OPT[v];
+    if (k === 'exp') return EXP_OPT[v];
+    if (k === 'location' && v === '__none') return '(ไม่ระบุ)';
+    return v;
+  }
+  function passFilter(it) {
+    var p = byType[it.type_code] || {};
+    if (filt.category && p.category !== filt.category) return false;
+    if (filt.type && it.type_code !== filt.type) return false;
+    if (filt.location && (filt.location === '__none' ? it.location : it.location !== filt.location)) return false;
+    if (filt.group && !members.some(function (m) { return m.group_id === filt.group && m.code === it.code; })) return false;
+    if (filt.kind && kindOf(it) !== filt.kind) return false;
+    if (filt.exp) {
+      var d = daysTo(it.exp_date);
+      if (filt.exp === 'soon' && !(d !== null && d >= 0 && d <= 90)) return false;
+      if (filt.exp === 'expired' && !(d !== null && d < 0)) return false;
+      if (filt.exp === 'none' && it.exp_date) return false;
+    }
+    return true;
+  }
+  function setFilter(k, v) { if (v) filt[k] = v; else delete filt[k]; store('filt', filt); renderStock(); }
+
+  async function openFilters() {
+    var uniq = function (arr) { return arr.filter(function (v, i) { return v && arr.indexOf(v) === i; }).sort(function (a, b) { return String(a).localeCompare(String(b), 'th'); }); };
+    var sel = function (name, opts, cur) {
+      return '<select name="' + name + '"><option value="">ทั้งหมด</option>' + opts.map(function (o) {
+        return '<option value="' + esc(o[0]) + '"' + (o[0] === cur ? ' selected' : '') + '>' + esc(o[1]) + '</option>';
+      }).join('') + '</select>';
+    };
+    var html = '<h3>ตัวกรอง</h3>' +
+      '<label>หมวดหมู่' + sel('category', uniq(products.map(function (p) { return p.category; })).map(function (c) { return [c, c]; }), filt.category) + '</label>' +
+      '<label>รุ่น / ประเภทสินค้า' + sel('type', products.slice().sort(SORTS.products.name[1]).map(function (p) { return [p.type_code, (p.name || p.type_code) + (p.ref ? ' · ' + p.ref : '')]; }), filt.type) + '</label>' +
+      '<label>ที่เก็บ' + sel('location', uniq(items.map(function (i) { return i.location; })).map(function (l) { return [l, l]; }).concat([['__none', '(ไม่ระบุ)']]), filt.location) + '</label>' +
+      '<label>กลุ่ม' + sel('group', groups.slice().sort(SORTS.groups.date[1]).map(function (g) { return [g.group_id, g.name]; }), filt.group) + '</label>' +
+      '<div class="grid2"><label>ชนิด' + sel('kind', Object.keys(KIND_OPT).map(function (k) { return [k, KIND_OPT[k]]; }), filt.kind) + '</label>' +
+      '<label>วันหมดอายุ' + sel('exp', Object.keys(EXP_OPT).map(function (k) { return [k, EXP_OPT[k]]; }), filt.exp) + '</label></div>';
+    var r = await dialog(html, [['ล้างทั้งหมด', '', 'clear'], ['ยกเลิก'], ['ใช้ตัวกรอง', 'primary', 'ok']]);
+    if (r.btn === 'clear') filt = {};
+    else if (r.btn === 'ok') { filt = {}; Object.keys(FILTER_TH).forEach(function (k) { if (r.data[k]) filt[k] = r.data[k]; }); }
+    else return;
+    store('filt', filt);
+    if (stockMode === 'groups') setStockMode('items'); else renderStock();
+  }
+
+  /* multi-select (item rows) */
+  var selectMode = false, selected = {};
+  // in the order shown on screen (current sort), so copied lists match what the user sees
+  function selectedItems() {
+    var shown = lastList.filter(function (it) { return selected[it.code]; });
+    return shown.concat(items.filter(function (it) { return selected[it.code] && shown.indexOf(it) < 0; }));
+  }
+  function setSelectMode(on) {
+    selectMode = on; selected = {};
+    document.body.classList.toggle('selecting', on);
+    $('#btnSelect').textContent = on ? 'ยกเลิกเลือก' : 'เลือก';
+    renderStock();
+  }
+  function renderSelBar() {
+    var n = Object.keys(selected).length;
+    $('#selBar').hidden = !selectMode;
+    $('#selN').textContent = 'เลือก ' + n + ' รายการ';
+    document.querySelectorAll('#selBar [data-sa]').forEach(function (b) { b.disabled = !n; });
+  }
+
+  var lastList = [];
+  function renderStock() {
+    var mode = stockMode;
+    document.querySelectorAll('#stockSeg button').forEach(function (b) { b.classList.toggle('on', b.dataset.mode === mode); });
+    var q = ($('#stockSearch').value || '').trim().toLowerCase();
+    var hit = function (arr) { return !q || arr.join(' ').toLowerCase().indexOf(q) >= 0; };
+    var sorts = SORTS[mode], cur = sorts[sortBy[mode]] ? sortBy[mode] : Object.keys(sorts)[0];
+    $('#sortSel').innerHTML = Object.keys(sorts).map(function (k) { return '<option value="' + k + '"' + (k === cur ? ' selected' : '') + '>เรียง: ' + esc(sorts[k][0]) + '</option>'; }).join('');
+    $('#btnFilter').hidden = mode === 'groups';
+    $('#btnSelect').hidden = mode !== 'items';
+    $('#btnNewGroup').hidden = mode !== 'groups';
+    $('#btnAddManual').hidden = mode === 'groups';
+    var nf = mode === 'groups' ? 0 : Object.keys(filt).length;
+    $('#filterCount').textContent = nf; $('#filterCount').hidden = !nf;
+    $('#activeFilters').innerHTML = nf ? Object.keys(filt).map(function (k) {
+      return '<button type="button" class="fchip" data-clear="' + k + '">' + esc(FILTER_TH[k]) + ': ' + esc(filterLabel(k, filt[k])) + ' ✕</button>';
+    }).join('') : '';
+    renderSummary();
+    var html = '', count = '';
+    if (mode === 'products') {
+      var plist = products.filter(function (p) { return (!filt.category || p.category === filt.category) && hit([p.type_code, p.name, p.ref, p.category, p.brand, p.note]); })
+        .sort(sorts[cur][1]);
+      html = plist.map(function (p) {
+        var n = unitsOf(p.type_code).length;
+        return '<li class="tap" data-type="' + esc(p.type_code) + '">' + thumb(p) + '<div class="main"><div class="t">' + esc(p.name || '(ไม่มีชื่อ)') + '</div>' +
+          '<div class="s">' + esc([p.ref, p.category, p.brand].filter(Boolean).join(' · ') || p.type_code) + '</div></div>' +
+          '<div class="qty">' + (n ? esc(totalOf(p.type_code)) : '<span class="muted small">ไม่มีของ</span>') + '</div></li>';
+      }).join('');
+      count = 'ประเภทสินค้า ' + products.length + ' รายการ' + (q || filt.category ? ' · พบ ' + plist.length : '');
+    } else if (mode === 'groups') {
+      var glist = groups.filter(function (g) { return hit([g.name, g.place, g.note]); }).sort(sorts[cur][1]);
+      html = glist.map(function (g) {
+        var n = membersOf(g.group_id).length;
+        return '<li class="tap" data-group="' + esc(g.group_id) + '"><div class="thumb">👥</div><div class="main"><div class="t">' + esc(g.name) + '</div>' +
+          '<div class="s">' + esc([g.place ? '→ ' + g.place : '', g.note].filter(Boolean).join(' · ') || '—') + '</div>' +
+          (g.date ? '<div class="chips">' + dueBadge(g.date) + '</div>' : '') + '</div><div class="qty">' + n + '</div></li>';
+      }).join('');
+      count = 'กลุ่ม ' + groups.length + (q ? ' · พบ ' + glist.length : '');
+    } else {
+      var list = items.filter(function (it) {
+        var p = byType[it.type_code] || {};
+        return passFilter(it) && hit([it.code, it.serial, it.lot, it.ref, it.location, it.note, p.name, p.category, p.brand]);
+      }).sort(sorts[cur][1]);
+      lastList = list;
+      html = list.map(function (it) {
+        var p = byType[it.type_code], gs = groupsOf(it.code);
+        return '<li class="tap' + (selected[it.code] ? ' selected' : '') + '" data-code="' + esc(it.code) + '">' +
+          (selectMode ? '<span class="sel-box" aria-hidden="true">' + (selected[it.code] ? '✓' : '') + '</span>' : '') + thumb(p) +
+          '<div class="main"><div class="t">' + esc((p && p.name) || it.type_code) + '</div>' +
+          '<div class="s">' + esc([itemId(it), it.location, it.note].filter(Boolean).join(' · ')) + '</div>' +
+          ((it.exp_date || gs.length) ? '<div class="chips">' + (it.exp_date ? expBadge(it.exp_date) : '') +
+            gs.map(function (g) { return '<span class="chip">👥 ' + esc(g.name) + '</span>'; }).join('') + '</div>' : '') + '</div>' +
+          (it.serial ? '' : '<div class="qty">' + esc(it.qty) + ' ' + esc(it.unit || '') + '</div>') + '</li>';
+      }).join('');
+      count = 'ในคลัง ' + items.length + ' รายการ' + (q || nf ? ' · พบ ' + list.length : '');
+    }
+    $('#stockCount').textContent = count;
+    var empty = mode === 'groups' ? (groups.length ? 'ไม่พบกลุ่มที่ค้นหา' : 'ยังไม่มีกลุ่ม — กด "+ สร้างกลุ่ม"')
+      : (mode === 'products' ? products : items).length ? 'ไม่พบรายการที่ตรงกับคำค้น/ตัวกรอง' : 'ยังไม่มีข้อมูล — ไปสแกนเพื่อลงทะเบียน';
+    $('#stockList').innerHTML = html || '<li class="empty">' + empty + '</li>';
+    renderSelBar();
+  }
+
+  function renderSummary() {
+    var soon = 0, expired = 0;
+    items.forEach(function (it) { var d = daysTo(it.exp_date); if (d !== null) { if (d < 0) expired++; else if (d <= 90) soon++; } });
+    var due = groups.filter(function (g) { var d = daysTo(g.date); return d !== null && d <= 0; }).length;
+    $('#stockSummary').innerHTML =
+      '<button type="button" class="sum" data-sum="all"><b>' + items.length + '</b><span>ในคลัง</span></button>' +
+      '<button type="button" class="sum' + (soon ? ' warn' : '') + '" data-sum="soon"><b>' + soon + '</b><span>ใกล้หมดอายุ</span></button>' +
+      '<button type="button" class="sum' + (expired ? ' bad' : '') + '" data-sum="expired"><b>' + expired + '</b><span>หมดอายุแล้ว</span></button>' +
+      '<button type="button" class="sum' + (due ? ' warn' : '') + '" data-sum="groups"><b>' + groups.length + '</b><span>กลุ่ม' + (due ? ' · ถึงกำหนด ' + due : '') + '</span></button>';
+  }
+  $('#stockSummary').addEventListener('click', function (e) {
+    var b = e.target.closest('[data-sum]'); if (!b) return;
+    var k = b.dataset.sum;
+    if (k === 'groups') return setStockMode('groups');
+    filt = k === 'all' ? {} : { exp: k };
+    store('filt', filt);
+    sortBy.items = k === 'all' ? sortBy.items : 'exp'; store('sortBy', sortBy);
+    setStockMode('items');
   });
+
+  function setStockMode(m) {
+    stockMode = m; store('stockMode', m);
+    if (m !== 'items' && selectMode) setSelectMode(false); else renderStock();
+  }
+  document.querySelectorAll('#stockSeg button').forEach(function (b) { b.addEventListener('click', function () { setStockMode(b.dataset.mode); }); });
+  $('#stockSearch').addEventListener('input', renderStock);
+  $('#sortSel').addEventListener('change', function () { sortBy[stockMode] = this.value; store('sortBy', sortBy); renderStock(); });
+  $('#btnFilter').addEventListener('click', openFilters);
+  $('#activeFilters').addEventListener('click', function (e) { var b = e.target.closest('[data-clear]'); if (b) setFilter(b.dataset.clear, ''); });
+  $('#btnSelect').addEventListener('click', function () { setSelectMode(!selectMode); });
+  $('#btnSelDone').addEventListener('click', function () { setSelectMode(false); });
+  $('#btnSelAll').addEventListener('click', function () {
+    var all = lastList.length && lastList.every(function (it) { return selected[it.code]; });
+    lastList.forEach(function (it) { if (all) delete selected[it.code]; else selected[it.code] = true; });
+    renderStock();
+  });
+  $('#stockList').addEventListener('click', function (e) {
+    var li = e.target.closest('li.tap');
+    if (!li) return;
+    if (li.dataset.group) return openGroup(li.dataset.group);
+    if (li.dataset.type) return openProduct(byType[li.dataset.type]);
+    if (selectMode) {
+      var c = li.dataset.code;
+      if (selected[c]) delete selected[c]; else selected[c] = true;
+      return renderStock();
+    }
+    openItem(byCode[li.dataset.code]);
+  });
+  $('#btnRefresh').addEventListener('click', function () { var b = this; busy(b, function () { return syncAll(false); }); });
+  $('#btnAddManual').addEventListener('click', function () { recode(true); });
+  $('#btnExport').addEventListener('click', function () {
+    if (stockMode === 'items') exportCsv(lastList, Object.keys(filt).length ? 'qr-stock-filtered' : 'qr-stock');
+    else exportCsv(items, 'qr-stock');
+  });
+  $('#btnNewGroup').addEventListener('click', async function () {
+    var g = await editGroup(null);
+    if (g) openGroup(g.group_id);
+  });
+
+  /* bulk actions on the selection */
+  $('#selBar').addEventListener('click', async function (e) {
+    var b = e.target.closest('[data-sa]'); if (!b) return;
+    var list = selectedItems(), codes = list.map(function (it) { return it.code; });
+    if (!list.length) return;
+    var act = b.dataset.sa;
+    if (act === 'copy') return copyText(listText(list));
+    if (act === 'csv') return exportCsv(list, 'qr-stock-selected');
+    if (act === 'group') {
+      var r = await chooseGroup('ใส่ ' + list.length + ' รายการเข้ากลุ่ม', '', false);
+      if (!r) return;
+      await busy(b, async function () {
+        try {
+          if (r.newGroup) { r.newGroup.codes = codes; var g = await createGroup(r.newGroup); toast('สร้างกลุ่ม "' + g.name + '" พร้อม ' + list.length + ' รายการ'); }
+          else {
+            var res = await api('groupAdd', { group_id: r.group_id, codes: codes });
+            addMembers(res.members); saveLocal();
+            toast('เพิ่มเข้ากลุ่มแล้ว ' + res.members.length + ' รายการ' + (res.members.length < list.length ? ' (ที่เหลืออยู่ในกลุ่มแล้ว)' : ''));
+          }
+          setSelectMode(false);
+        } catch (err) { toast(errText(err), true); }
+      });
+      return;
+    }
+    if (act === 'edit') {
+      var ed = await dialog('<h3>แก้ไข ' + list.length + ' รายการพร้อมกัน</h3><p class="small muted" style="margin:0">ช่องที่เว้นว่าง = ไม่เปลี่ยน</p>' +
+        '<label>ที่เก็บ<input name="location" list="dlLocation"></label>' +
+        '<label>หน่วย (เฉพาะรายการที่นับจำนวน)<input name="unit"></label>' +
+        '<label>Note<textarea name="note" rows="3"></textarea></label>' +
+        '<label class="check"><input type="checkbox" name="replace"> แทนที่ note เดิม (ไม่ติ๊ก = ต่อท้าย)</label>', [['ยกเลิก'], ['บันทึก', 'primary', 'ok']]);
+      if (ed.btn !== 'ok') return;
+      var set = {};
+      if (ed.data.location.trim()) set.location = ed.data.location.trim();
+      if (ed.data.unit.trim()) set.unit = ed.data.unit.trim();
+      if (ed.data.note.trim()) set.note = ed.data.note.trim();
+      if (!Object.keys(set).length) return toast('ไม่ได้ใส่ค่าที่จะแก้', true);
+      await busy(b, async function () {
+        try {
+          var res = await api('bulkUpdate', { codes: codes, set: set, noteMode: ed.data.replace ? 'replace' : 'append' });
+          res.items.forEach(putItem);
+          toast('แก้ไขแล้ว ' + res.items.length + ' รายการ');
+          setSelectMode(false);
+        } catch (err) { toast(errText(err), true); }
+      });
+      return;
+    }
+    if (act === 'del') {
+      if (!(await confirmBox('ลบ ' + list.length + ' รายการออกจากคลัง? (ประวัติยังอยู่ใน Sheet)', 'ลบ'))) return;
+      await busy(b, async function () {
+        try {
+          await api('removeItems', { codes: codes });
+          items = items.filter(function (it) { return !selected[it.code]; });
+          members = members.filter(function (m) { return codes.indexOf(m.code) < 0; });
+          saveLocal();
+          toast('ลบแล้ว ' + list.length + ' รายการ');
+          setSelectMode(false);
+        } catch (err) { toast(errText(err), true); }
+      });
+    }
+  });
+
+  /* ---------- groups ---------- */
+  function groupFields(g) {
+    g = g || {};
+    return '<label>ชื่อกลุ่ม *<input name="gname" required value="' + esc(g.name) + '" placeholder="เช่น ส่ง OR 2 วันพุธ"></label>' +
+      '<div class="grid2"><label>ส่งไป / ใช้ที่<input name="gplace" list="dlPlace" value="' + esc(g.place) + '"></label>' +
+      '<label>วันที่<input name="gdate" type="date" value="' + esc(g.date) + '"></label></div>' +
+      '<label>Note<textarea name="gnote" rows="2">' + esc(g.note) + '</textarea></label>';
+  }
+  async function createGroup(g) {
+    var res = await api('saveGroup', { group: { name: g.name, place: g.place, date: g.date, note: g.note }, codes: g.codes || [] });
+    groups.push(res.group);
+    addMembers(res.members);
+    saveLocal();
+    return res.group;
+  }
+  // create (g = null) or edit; -> saved group or null
+  async function editGroup(g) {
+    var r = await dialog('<h3>' + (g ? 'แก้ไขกลุ่ม' : 'สร้างกลุ่ม') + '</h3>' + groupFields(g), [['ยกเลิก'], [g ? 'บันทึก' : 'สร้างกลุ่ม', 'primary', 'ok']]);
+    if (r.btn !== 'ok') return null;
+    var d = { name: r.data.gname.trim(), place: r.data.gplace.trim(), date: r.data.gdate, note: r.data.gnote };
+    try {
+      if (!g) { var made = await createGroup(d); toast('สร้างกลุ่มแล้ว'); return made; }
+      var res = await api('saveGroup', { group: Object.assign({ group_id: g.group_id }, d) });
+      groups = groups.map(function (x) { return x.group_id === g.group_id ? res.group : x; });
+      saveLocal();
+      toast('บันทึกแล้ว');
+      return res.group;
+    } catch (e) { toast(errText(e), true); return null; }
+  }
+  // "choose a group or make a new one" block used by batch save, bulk add and the batch chip
+  function groupPickerHtml(cur, label) {
+    var opts = groups.slice().sort(SORTS.groups.date[1]).map(function (g) {
+      return '<option value="' + esc(g.group_id) + '"' + (g.group_id === cur ? ' selected' : '') + '>' + esc(g.name + (g.place ? ' → ' + g.place : '')) + '</option>';
+    }).join('');
+    return '<fieldset class="card" style="box-shadow:none"><b>' + esc(label || 'กลุ่ม') + '</b>' +
+      '<select name="gsel"><option value="">— ไม่ใส่กลุ่ม —</option>' + opts + '<option value="__new">+ สร้างกลุ่มใหม่…</option></select>' +
+      '<div data-newgroup hidden>' + groupFields(null) + '</div></fieldset>';
+  }
+  function wireGroupPicker(form) {
+    var sel = form.querySelector('[name=gsel]'), box = form.querySelector('[data-newgroup]');
+    if (!sel) return;
+    var sync = function () { var on = sel.value === '__new'; box.hidden = !on; form.querySelector('[name=gname]').required = on; };
+    sel.addEventListener('change', sync); sync();
+  }
+  async function groupFromPicker(d) {
+    if (d.gsel === '__new') return (await createGroup({ name: d.gname.trim(), place: d.gplace.trim(), date: d.gdate, note: d.gnote })).group_id;
+    return d.gsel || '';
+  }
+  // -> {group_id} | {newGroup} | {clear} | null
+  async function chooseGroup(title, cur, allowClear) {
+    var btns = [['ยกเลิก']];
+    if (allowClear && cur) btns.push(['ไม่ใส่กลุ่ม', '', 'clear']);
+    btns.push(['ตกลง', 'primary', 'ok']);
+    var r = await dialog('<h3>' + esc(title) + '</h3>' + groupPickerHtml(cur, 'เลือกกลุ่ม'), btns, wireGroupPicker);
+    if (r.btn === 'clear') return { clear: true };
+    if (r.btn !== 'ok') return null;
+    if (r.data.gsel === '__new') return { newGroup: { name: r.data.gname.trim(), place: r.data.gplace.trim(), date: r.data.gdate, note: r.data.gnote } };
+    if (!r.data.gsel) return allowClear ? { clear: true } : null;
+    return { group_id: r.data.gsel };
+  }
+
+  // search the stock and tick items to add
+  async function pickItems(title, exclude) {
+    var pool = items.filter(function (it) { return !exclude[it.code]; }).sort(SORTS.items.name[1]);
+    if (!pool.length) { toast('ไม่มีรายการอื่นในคลังให้เพิ่ม', true); return []; }
+    var html = '<h3>' + esc(title) + '</h3><input id="pickQ" type="search" placeholder="ค้นหา ชื่อ SN Lot REF ที่เก็บ" autocomplete="off">' +
+      '<div class="toolbar"><button type="button" class="btn small" id="pickAll">เลือกทั้งหมดที่แสดง</button><span class="small muted" id="pickN"></span></div>' +
+      '<ul class="pick-list">' + pool.map(function (it) {
+        var key = [itemName(it), itemId(it), it.ref, it.location, it.note, it.type_code].join(' ').toLowerCase();
+        return '<li data-k="' + esc(key) + '"><label class="check"><input type="checkbox" name="pick" value="' + esc(it.code) + '"> <span>' + esc(itemLine(it)) +
+          (it.location ? ' <span class="muted small">· ' + esc(it.location) + '</span>' : '') + '</span></label></li>';
+      }).join('') + '</ul>';
+    var r = await dialog(html, [['ยกเลิก'], ['เพิ่มที่เลือก', 'primary', 'ok']], function (form) {
+      var q = $('#pickQ');
+      var count = function () { $('#pickN').textContent = 'เลือก ' + form.querySelectorAll('[name=pick]:checked').length; };
+      q.addEventListener('input', function () {
+        var v = q.value.trim().toLowerCase();
+        form.querySelectorAll('.pick-list li').forEach(function (li) { li.hidden = v && li.dataset.k.indexOf(v) < 0; });
+      });
+      $('#pickAll').addEventListener('click', function () {
+        form.querySelectorAll('.pick-list li:not([hidden]) input').forEach(function (i) { i.checked = true; });
+        count();
+      });
+      form.addEventListener('change', count);
+      count();
+    });
+    return r.btn === 'ok' ? (r.data.pick || []) : [];
+  }
+
+  async function openGroup(gid) {
+    for (;;) {
+      var g = groups.filter(function (x) { return x.group_id === gid; })[0];
+      if (!g) return;
+      var list = membersOf(gid).sort(SORTS.items.name[1]);
+      var html = '<h3>👥 ' + esc(g.name) + '</h3>' +
+        '<p class="small" style="margin:0">' + [g.place ? 'ส่งไป / ใช้ที่ <b>' + esc(g.place) + '</b>' : '', g.date ? dueBadge(g.date) : '', list.length + ' รายการ'].filter(Boolean).join(' · ') + '</p>' +
+        (g.note ? '<div class="note-box">' + esc(g.note) + '</div>' : '') +
+        '<div class="row-start">' +
+        '<button class="btn small" value="copy" formnovalidate' + (list.length ? '' : ' disabled') + '>📋 คัดลอกรายการ</button>' +
+        '<button class="btn small" value="pick" formnovalidate>🔎 เพิ่มจากคลัง</button>' +
+        '<button class="btn small" value="scan" formnovalidate>📷 สแกนเข้ากลุ่ม</button></div>' +
+        (list.length ? '<ol class="group-list">' + list.map(function (it, i) {
+          return '<li><span class="num">' + (i + 1) + '.</span><button class="linkish" value="open:' + esc(it.code) + '" formnovalidate>' + esc(itemLine(it)) +
+            (it.location ? ' <span class="muted small">· ' + esc(it.location) + '</span>' : '') + '</button>' +
+            '<button class="btn small" value="rm:' + esc(it.code) + '" formnovalidate aria-label="เอาออกจากกลุ่ม">✕</button></li>';
+        }).join('') + '</ol>' : '<p class="muted">ยังไม่มีรายการ — กด "เพิ่มจากคลัง" หรือ "สแกนเข้ากลุ่ม"</p>');
+      var r = await dialog(html, [['ลบกลุ่ม', 'danger', 'delg'], ['แก้ไข', '', 'edit'], ['CSV', '', 'csv'], ['ปิด']]);
+      var b = r.btn;
+      if (b === 'copy') { await copyText(listText(list, g)); continue; }
+      if (b === 'csv') { exportCsv(list, 'group-' + g.name.replace(/[^\w฀-๿-]+/g, '_')); continue; }
+      if (b === 'edit') { await editGroup(g); continue; }
+      if (b === 'scan') { setBatchGroup(gid); setMode('batch'); go('scan'); toast('สแกนได้เลย — กด "บันทึกทั้งหมด" แล้วรายการจะเข้ากลุ่ม "' + g.name + '"'); return; }
+      if (b === 'pick') {
+        var ex = {}; list.forEach(function (it) { ex[it.code] = 1; });
+        var codes = await pickItems('เพิ่มเข้ากลุ่ม "' + g.name + '"', ex);
+        if (codes.length) {
+          try { var res = await api('groupAdd', { group_id: gid, codes: codes }); addMembers(res.members); saveLocal(); toast('เพิ่มแล้ว ' + res.members.length + ' รายการ'); }
+          catch (e) { toast(errText(e), true); }
+        }
+        continue;
+      }
+      if (b.indexOf('rm:') === 0) {
+        var code = b.slice(3);
+        try { await api('groupRemove', { group_id: gid, codes: [code] }); members = members.filter(function (m) { return !(m.group_id === gid && m.code === code); }); saveLocal(); toast('เอาออกจากกลุ่มแล้ว'); }
+        catch (e) { toast(errText(e), true); }
+        continue;
+      }
+      if (b.indexOf('open:') === 0) { await openItem(byCode[b.slice(5)]); continue; }
+      if (b === 'delg') {
+        if (await confirmBox('ลบกลุ่ม "' + g.name + '"? (ของในคลังไม่ถูกลบ)', 'ลบกลุ่ม')) {
+          try { await api('removeGroup', { group_id: gid }); groups = groups.filter(function (x) { return x.group_id !== gid; }); members = members.filter(function (m) { return m.group_id !== gid; }); saveLocal(); toast('ลบกลุ่มแล้ว'); }
+          catch (e) { toast(errText(e), true); }
+          return;
+        }
+        continue;
+      }
+      return;
+    }
+  }
 
   /* ---------- rules ---------- */
   var ROLE_TH = { type: 'ประเภทสินค้า', serial: 'Serial (รายเครื่อง)', lot: 'Lot (ล็อต)' };
