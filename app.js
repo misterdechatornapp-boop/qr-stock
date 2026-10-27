@@ -1,7 +1,7 @@
 /* QR Stock — UI */
 (function () {
   'use strict';
-  var APP_VERSION = '1.6.0';
+  var APP_VERSION = '1.6.1';
   var SETUP_PREFIX = 'QRSTOCK-SETUP:';
   var R = window.QRRules;
 
@@ -680,6 +680,10 @@
       h += '<div class="section-label">' + KIND_TH[kind] + '</div><dl class="kv">' +
         (kind !== 'serial' ? '<dt>จำนวน</dt><dd><div class="qty-row"><button class="btn" type="button" data-act="minus" aria-label="ลด">−</button><b>' + esc(it.qty === '' ? 0 : it.qty) + '</b><button class="btn" type="button" data-act="plus" aria-label="เพิ่ม">+</button><span>' + esc(it.unit || '') + '</span></div></dd>' : '') +
         (it.location ? '<dt>ที่เก็บ</dt><dd>' + esc(it.location) + '</dd>' : '') +
+        (groupsOf(it.code).length ? '<dt>อยู่ในกลุ่ม</dt><dd class="chips">' + groupsOf(it.code).map(function (g) {
+          return '<button type="button" class="chip chip-btn" data-act="group" data-gid="' + esc(g.group_id) + '">👥 ' + esc(g.name) +
+            (g.place ? ' → ' + esc(g.place) : '') + '</button>' + (g.date ? ' ' + dueBadge(g.date) : '');
+        }).join(' ') + '</dd>' : '') +
         '<dt>ลงทะเบียนเมื่อ</dt><dd>' + fmtDate(it.created_at) + '</dd>' +
         '<dt>สแกนแล้ว</dt><dd>' + esc(it.scan_count || 0) + ' ครั้ง</dd></dl>' +
         (it.note ? '<div><div class="muted small">Note</div><div class="note-box">' + esc(it.note) + '</div></div>' : '') +
@@ -768,6 +772,7 @@
     if (act === 'next') { current = null; renderResult(); resumeCam(); }
     else if (act === 'edit') openItem(current.item);
     else if (act === 'product') openProduct(current.product || { type_code: current.type });
+    else if (act === 'group') openGroup(b.dataset.gid);
     else if (act === 'history') openHistory(current.code);
     else if (act === 'plus' || act === 'minus') busy(b, function () { return changeQty(act === 'plus' ? 1 : -1); });
     else if (act === 'rule') { $('#ruleSample').value = current.raw; go('rules'); }
@@ -1044,7 +1049,8 @@
       return '<li class="batch-row" data-code="' + esc(e.code) + '">' + thumb(p) +
         '<div class="main" data-b="open"><div class="t">' + esc((p && p.name) || e.type) + '</div>' +
         '<div class="s">' + esc(id) + (extra ? ' · ' + esc(extra) : '') + '</div>' +
-        '<div class="chips">' + ROW_CHIP[s] + (e.ocr ? '<span class="badge warn">OCR</span>' : '') + (e.exp_date ? expBadge(e.exp_date) : '') + '</div></div>' +
+        '<div class="chips">' + ROW_CHIP[s] + (e.ocr ? '<span class="badge warn">OCR</span>' : '') + (e.exp_date ? expBadge(e.exp_date) : '') +
+        groupsOf(e.code).map(function (g) { return '<span class="chip">👥 ' + esc(g.name) + '</span>'; }).join('') + '</div></div>' +
         (e.serial ? '' : '<div class="qty">×' + esc(e.qty || e.count) + '</div>') +
         '<div class="acts"><button class="btn" type="button" data-b="edit" aria-label="แก้รายชิ้น">✎</button><button class="btn" type="button" data-b="del" aria-label="เอาออก">×</button></div></li>';
     }).join('') || '';
